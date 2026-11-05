@@ -6,6 +6,7 @@ scripts/accuracy_top1_h100.sh
 scripts/aws_remote.sh
 scripts/diag_top1_layers.py
 scripts/h100_7b_check.sh
+scripts/land_public_pr.sh
 scripts/licence_dev.py
 scripts/licence_test_kit.sh
 scripts/nki_7b_inf2.sh

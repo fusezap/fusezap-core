@@ -1,0 +1,8 @@
+# Code owners: GitHub requests these reviewers automatically, and a pull request needs one code owner's approval
+# (GOVERNANCE.md). Add an area's reviewers on its line as they join (MAINTAINERS.md).
+*                        @Yoshi-techyodl
+/fusezap/codegen/        @Yoshi-techyodl
+/fusezap/device/         @Yoshi-techyodl
+/fusezap/serve/          @Yoshi-techyodl
+/docs/                   @Yoshi-techyodl
+/.github/                @Yoshi-techyodl

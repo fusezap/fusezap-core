@@ -15,7 +15,9 @@ change so we can agree on the approach first.
    Performance claims need the hardware, the baseline and the command that reproduces them (docs/BENCH_METHOD.md).
 3. Fill in the pull request template, including the one-line "Release note:" (or "none"), which goes into
    CHANGELOG.md.
-4. CI must pass, and a maintainer reviews every change before it is merged.
+4. CI must pass, and a code owner reviews every change before it is merged. How pull requests are decided, who
+   reviews them, and how long you can expect to wait (a first response within 5 working days) are in
+   [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Sign your commits (DCO)
 

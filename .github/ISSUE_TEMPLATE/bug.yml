@@ -1,0 +1,23 @@
+name: Bug
+description: Something is wrong
+labels: ["type/bug", "status/needs-triage"]
+body:
+  - type: textarea
+    id: what
+    attributes: {label: What happened, and what did you expect?}
+    validations: {required: true}
+  - type: textarea
+    id: repro
+    attributes: {label: How to reproduce, description: "The command or request, the model, and any settings."}
+    validations: {required: true}
+  - type: input
+    id: version
+    attributes: {label: Version, description: 'python -c "import fusezap; print(fusezap.__version__)"'}
+    validations: {required: true}
+  - type: input
+    id: hw
+    attributes: {label: Hardware and backend, placeholder: "e.g. H100 80GB, CUDA 13.0 / Apple M3 Max, METAL / inf2.8xlarge, NEURON"}
+    validations: {required: true}
+  - type: textarea
+    id: logs
+    attributes: {label: Logs, render: text}
