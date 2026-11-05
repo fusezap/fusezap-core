@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+
+# tracker data stays local (confidential interview notes)
+tracker/data/
+.venv-nki/
+.venv-nrt/
+
+# I81 diffusion reference tensors and images (large; regenerate with scripts/diff_ref.py)
+/results/
+
+# licence signing keys never enter the repo
+*.pem
+# (spelled with [cs]: scripts/public_export.py flags the literal dev-key file name as a key reference)
+*licen[cs]e-dev-key*
+*.lic
+# packaging/validate build outputs
+packaging/validate/build/
+packaging/validate/dist/
+# local scratch (wheel builds, venvs, logs)
+.scratch/
+.DS_Store
+
+# I95: references staged for pod jobs (scripts/diff_stage_refs.sh); rsync carries them, git does not
+/.stage/
