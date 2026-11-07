@@ -5,6 +5,7 @@ scripts/accuracy_confirm_h100.sh
 scripts/accuracy_top1_h100.sh
 scripts/aws_remote.sh
 scripts/diag_top1_layers.py
+scripts/engine_repro_job.sh
 scripts/h100_7b_check.sh
 scripts/land_public_pr.sh
 scripts/licence_dev.py
@@ -12,6 +13,8 @@ scripts/licence_test_kit.sh
 scripts/nki_7b_inf2.sh
 scripts/nki_bf16_compare.py
 scripts/nki_bf16_trn1.sh
+scripts/nki_klein_inf2.sh
+scripts/nki_klein_neff_pod.sh
 scripts/nki_llama8b_inf2.sh
 scripts/nki_n5_inf2.sh
 scripts/nki_n5_serve.py
@@ -58,6 +61,7 @@ scripts/tp_m5_ar.sh
 scripts/tracker.sh
 scripts/validate_70b_vllm.sh
 scripts/validate_7b_h100.sh
+scripts/validate_engine_job.sh
 scripts/validate_followups_cuda.sh
 scripts/validate_i53_vllm.sh
 scripts/validate_v01_vllm.sh

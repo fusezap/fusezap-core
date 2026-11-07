@@ -14,8 +14,11 @@ FuseZap is built by Techyodl. Website: https://fusezap.ai
 ## What it does
 
 - **Models**: decoder-only text models with the Llama architecture, loaded from Hugging Face safetensors checkpoints:
-  `model_type` `llama`, `qwen2` and `mistral` (for example Llama 3.x, Qwen2.5, Mistral). No vision, audio or
-  mixture-of-experts models.
+  `model_type` `llama`, `qwen2` and `mistral` (for example Llama 3.x, Qwen2.5, Mistral). No vision-language, audio or
+  mixture-of-experts models, and no sliding-window attention yet.
+- **Image generation** (Preview): one text-to-image diffusion model, FLUX.2 [klein] 4B, served separately with
+  `fusezap serve-image flux2-klein`. It is checked for correctness against a float32 reference image; it is not fast
+  yet (see the matrix notes).
 - **Backends** (`--device`):
   - `CUDA`: NVIDIA GPUs. NVRTC-compiled kernels, tensor-core GEMMs, flash attention, CUDA-graph decode, bf16 / int8 /
     fp8, tensor parallelism (`--tp N`).
@@ -41,7 +44,7 @@ source lists the gate it passed. **Supported** starts with the first release. A 
 | Qwen2.5-32B-Instruct | — | — | Preview | — | — | — | — |
 | Qwen2.5-72B-Instruct | — | — | — | Preview | — | — | — |
 | Llama-3.3-70B-Instruct | — | — | — | Preview | — | — | — |
-| FLUX.2-klein-4B (image) | — | — | Preview | Preview | Preview | Preview | — |
+| FLUX.2-klein-4B (image) | Preview | Preview | Preview | Preview | Preview | Preview | — |
 
 Mistral checkpoints load through the same Llama code path and are covered by unit tests, but have not been measured
 on hardware yet. Known gaps are in [CHANGELOG.md](CHANGELOG.md) under "Known issues".

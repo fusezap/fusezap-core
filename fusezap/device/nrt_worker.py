@@ -37,7 +37,9 @@ N8: a "load" may carry "cc": {"rank", "world"}: the NEFF holds collectives (nki.
 nrt_load_collectives (nrtpy load_from_neff(cc_enabled=True, rank_id, world_size); the runtime bootstraps the ranks through
 NEURON_RT_ROOT_COMM_ID, which fusezap.serve.neuron_tp sets for every rank's worker).
 N8 (I71): a request's new buffers (a batch's: all of them) are allocated before any of it runs; if the runtime refuses one
-(NRT_RESOURCE) the ones made are freed and the reply is {"ok": False, "oom": True, "err"}: nothing ran.
+(NRT_RESOURCE) the ones made are freed and the reply is {"ok": False, "oom": True, "err"}: nothing ran. I96: except a batch
+whose launches carry frees, which goes in request order (frees, allocations, run) so its footprint is the host's, not the sum
+of every buffer it allocates; a refusal there names the launch and how many ran. "err" always ends with the worker's live bytes.
 """
 import mmap, os, pickle, struct, sys, time, traceback
 
@@ -189,13 +191,22 @@ def _alloc_all(reqs: list) -> None:
   except Exception as e:
     if "NRT_RESOURCE" not in str(e) and "allocate" not in str(e).lower(): raise
     for i in made: S.bufs.pop(i, None)
-    raise OOM(f"{type(e).__name__}: {e}") from e
+    raise OOM(f"{type(e).__name__}: {e}; the worker holds {live_bytes() / 2**30:.3f} GiB in {len(S.bufs)} buffers") from e
+
+def live_bytes() -> int:
+  """Device bytes of the buffers this worker holds (what the host's NeuronAllocator.held should equal, cache included)."""
+  return int(sum(int(t.shape[0]) for t in S.bufs.values()))
 
 def handle(req: dict) -> dict:
   import numpy as np
-  _alloc_all([req] + list(req.get("reqs") or []) if req.get("op") == "batch" else [req])
-  if req.get("free"): _free(req["free"])
   op = req.get("op")
+  # A batch whose launches carry frees is allocated and freed in request order (host order: a request's frees, then its
+  # allocations); allocating every "new" up front kept all the buffers the host had since freed live at once (I96 W7c: a
+  # 512^2 klein forward, one batch, 14.7 GB of tensors on a 7.4 GiB host account). A batch without frees (the same
+  # footprint either way) keeps the all-or-nothing allocation: a refused batch ran nothing.
+  seq = op == "batch" and any(r.get("free") for r in req.get("reqs") or [])
+  if req.get("free"): _free(req["free"])
+  if not seq: _alloc_all([req] + list(req.get("reqs") or []) if op == "batch" else [req])
   if op == "version":
     from importlib.metadata import version
     try: v = version("nrtpy")
@@ -253,6 +264,7 @@ def handle(req: dict) -> dict:
     secs, t0, data = [], time.perf_counter(), None
     for k, r in enumerate(req["reqs"]):
       try: rep = handle(r)
+      except OOM as e: raise OOM(f"launch {k} of a batch of {len(req['reqs'])} ({r.get('key')}; {k} ran): {e}") from e
       except Exception as e: raise RuntimeError(f"launch {k} of a batch of {len(req['reqs'])} ({r.get('key')}): {type(e).__name__}: {e}") from e
       if not rep.get("ok"): return {**rep, "err": f"launch {k} of a batch of {len(req['reqs'])}: {rep.get('err')}"}
       secs += rep.get("seconds", [])
@@ -271,7 +283,7 @@ def handle(req: dict) -> dict:
     o.write_from_numpy(r[:have])
     return {"ok": True, "seconds": [], "ar_s": time.perf_counter() - st}
   if op == "stats":
-    return {"ok": True, "buffers": len(S.bufs), "bytes": int(sum(t.shape[0] for t in S.bufs.values())), "models": len(S.models),
+    return {"ok": True, "buffers": len(S.bufs), "bytes": live_bytes(), "models": len(S.models),
             "execs": S.execs, "loads": S.loads}
   return {"ok": False, "err": f"unknown op {op!r}", "tb": ""}
 

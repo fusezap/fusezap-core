@@ -246,3 +246,31 @@ cells:
     evidence:
       - docs/status/i95-flux2-klein-cuda/README.md
     notes: "About 2.3x slower than diffusers. The float32 VAE does not fit in 24 GB."
+
+  - chip: aws-inf2
+    model: flux.2-klein-4b
+    status: Preview
+    config: bf16 transformer on one NeuronCore (inf2.8xlarge), Neuron SDK 2.33.0; text encoder on the host CPU; float32 VAE decode scored on Apple METAL
+    verified: 2026-11-05
+    gate: "G3, G4 and G6 against the float32 diffusers CPU reference: 512x512 (1 prompt) and 1024x1024 (2 prompts), all passed (G6 bar 17 dB)"
+    metrics:
+      - {name: lowest PSNR dB vs float32 at 1024x1024 (2 prompts), value: 35.0}
+      - {name: s per denoising step at 1024x1024, value: 28}
+    tested_with: {hardware: inf2.8xlarge}
+    evidence:
+      - "private: available on request"
+    notes: "Correctness only, not speed yet. The transformer runs on the chip; the text encoder ran on the host and the image was decoded on a Mac for the check."
+
+  - chip: aws-trn1
+    model: flux.2-klein-4b
+    status: Preview
+    config: bf16 transformer on one NeuronCore (trn1.2xlarge), Neuron SDK 2.33.0; text encoder on the host CPU; float32 VAE decode scored on Apple METAL
+    verified: 2026-11-05
+    gate: "G3, G4 and G6 against the float32 diffusers CPU reference: 512x512 and 1024x1024, 2 prompts each, all passed (G6 bar 17 dB)"
+    metrics:
+      - {name: lowest PSNR dB vs float32 at 1024x1024 (2 prompts), value: 35.0}
+      - {name: s per denoising step at 1024x1024, value: 30}
+    tested_with: {hardware: trn1.2xlarge}
+    evidence:
+      - "private: available on request"
+    notes: "Correctness only, not speed yet. The transformer runs on the chip; the text encoder ran on the host and the image was decoded on a Mac for the check."

@@ -424,7 +424,8 @@ class NeuronAllocator(LRUAllocator):
       if rep.get("oom"):   # N8: the worker refused the request's allocations before running any of it
         self.ooms += 1
         raise NeuronOOM(f"NEURON: the runtime refused device memory ({rep['err']}); host accounting {self.held / 2**30:.3f} GiB held, "
-                        f"{self.cached / 2**30:.3f} cached; nothing of the request ran")
+                        f"{self.cached / 2**30:.3f} cached"
+                        + ("" if " ran)" in str(rep["err"]) else "; nothing of the request ran"))
       raise NKISimError(f"NEURON: runtime worker {req.get('op')} failed: {rep['err']}\n{rep.get('tb', '')}")
     return rep
   def flush(self) -> None:

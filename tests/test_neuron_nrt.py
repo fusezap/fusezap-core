@@ -491,3 +491,46 @@ def test_api_maps_out_of_memory_to_503():
   assert e.status == 503 and e.code == "engine_out_of_memory" and e.message == "logprobs: no room"
   assert api._api_error(ValueError("bad")).status == 400 and api._api_error(RuntimeError("x")).status == 500
   assert api._err_kind(MemoryError()) == "oom" and api._err_kind(ValueError()) is True and api._err_kind(RuntimeError()) is False
+
+# ---------------------------------------------------------------- I96 W7c: a batch's frees (the klein 512^2 OOM)
+
+def _live(): return sum(len(t.tensor_ref.mem) for t in nrt_worker.S.bufs.values())
+
+class _Wk:
+  def __init__(self): self.peak = 0
+  def call(self, req):
+    rep = wcall(req)
+    self.peak = max(self.peak, _live())
+    return rep
+
+def test_batch_frees_release_before_later_allocations(nrt, tmp_path, monkeypatch):
+  """I96 W7c (inf2, 5 Nov 2026): the host accounted 7.35 GiB but the runtime held 14.7 GB. One flushed batch carried a whole
+  forward's launches; the worker allocated every launch's "new" buffers up front and applied their frees after, so every
+  activation the host had already freed was live at once. The worker's bytes must follow the host's (held, cache included)
+  at every reply, and a device that fits the host's account must not refuse the batch."""
+  monkeypatch.setenv("FZ_NEURON_HBM_GB", "0")
+  w = _Wk()
+  al = neuron.NeuronAllocator(worker=w)
+  al.cache_max = 0                                  # every freed block goes back to the worker
+  p = tmp_path / "m.neff"
+  p.write_bytes(pickle.dumps({"tensors": ({"data0.must_alias_input": (4, "float32"), "data1": (8, "float32")},
+                                          {"data0": (4, "float32")}, {"data0": "data0.must_alias_input"})}))
+  al.call({"op": "load", "key": "k", "path": str(p)})
+  ex = lambda a, b: al.call({"op": "exec", "key": "k", "in": {"data0.must_alias_input": a.id, "data1": b.id}, "out": {}, "alias": {"data0": "data0.must_alias_input"}})
+  weights = al.alloc(1000); al.copyin(weights, memoryview(np.zeros(1000, np.uint8)))
+  for _ in range(50):                               # 50 "layers": a pair of activations each, dropped after its launch
+    x, y = al.alloc(16), al.alloc(32)
+    ex(x, y)
+    al.free(x, 16); al.free(y, 32)
+  assert al.held == 1000 and len(al.pending) > 50   # nothing sent yet: one batch holds all 50 launches
+  limit = 1000 + 200                                # the device fits the host's account (peak 1048), not the sum of the new buffers (3400)
+  real = NrtpyTensor.from_numpy.__func__
+  def limited(cls, a, name=None, core_id=0):
+    if _live() + a.nbytes > limit: raise NrtError("NRT Error NRT_RESOURCE(4): Failed to allocate tensor")
+    return real(cls, a, name, core_id)
+  monkeypatch.setattr(NrtpyTensor, "from_numpy", classmethod(limited))
+  al.flush()
+  assert nrt.session.execs == 50 and w.peak <= limit
+  al.call({"op": "stats"})                          # the last frees ride on the next request
+  assert _live() == al.held + al.cached == 1000
+  assert wcall({"op": "stats"})["bytes"] == al.held

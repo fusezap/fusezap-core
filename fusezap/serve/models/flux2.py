@@ -20,6 +20,12 @@ like diffusers on CPU (Flux2PosEmbed) and are rounded to float32 once; the times
 serves every step and request (D7 jits `forward`). Weights keep diffusers' state-dict names (the name map is the
 identity for the diffusers layout). `forward` realizes after each block so the lazy graph and its live intermediates
 stay one block deep.
+
+NEURON tiers (I96 W1, docs/I96_DIFFUSION_NEURON_SCOPE.md): attention runs in float32 (the flash kernel; see sdpa), the
+attention output is made contiguous before its projections (a permuted view is not one strided view, so the matmul
+pattern would not take it), and with bf16 weights every 2-D linear weight is kept K-major (in, out) in bf16 and runs
+through neuron_kv.matmul_bf16 (bf16 operands on TensorE, float32 accumulation), so no float32 weight copy is made per
+call. FZ_KLEIN_NEURON_BF16MM=0 keeps Tensor.linear (casts to float32, then the float32 matmul). Other devices unchanged.
 """
 from __future__ import annotations
 import json, math, os
@@ -93,13 +99,19 @@ def sdpa(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
   from fusezap.helpers import getenv
   dt = q.dtype
   dev = str(q.device).split(":")[0].upper()
-  if dt != dtypes.float32 and dev == "METAL" and getenv("FZ_KLEIN_ATTN_F32", 1):
+  if dt != dtypes.float32 and (dev == "METAL" or _neuron(q.device)) and getenv("FZ_KLEIN_ATTN_F32", 1):
+    # NEURON (I96 W1): the scheduler's attention pattern is float32-only (schedule._match_attention), so a bf16 q/k/v
+    # would build the full (H, S, S) score tensor; in float32 the flash kernel (nki_kernels.render_attention) takes it
     return q.float().scaled_dot_product_attention(k.float(), v.float()).cast(dt)
   if dt in (dtypes.bfloat16, dtypes.float16) and dev == "CUDA" and q.shape[-1] == k.shape[-1] == v.shape[-1] in (64, 128) \
      and getenv("FZ_KLEIN_CUDA_FLASH", 1):
     from fusezap.device.cuda_kernels.attention import attention as flash
     return flash(q, k, v)
   return q.scaled_dot_product_attention(k, v)
+
+def _neuron(device) -> bool:
+  """A NEURON tier (NEURON, NKISHIM, NKISIM): fusezap.serve.neuron_kv.is_neuron without importing the serve stack."""
+  return str(device).split(":")[0].upper() in ("NEURON", "NKISHIM", "NKISIM")
 
 def cut(t: Tensor) -> Tensor:
   """t realized, as a new graph root: a LazyBuffer over the same device Buffer with no sources. A realized LazyBuffer
@@ -126,8 +138,13 @@ class Flux2Transformer:
     missing, extra = sorted(want - have), sorted(have - want)
     assert not missing and not extra, f"Flux2 weights: missing {missing[:6]}, unexpected {extra[:6]}"
     self.w: dict[str, Tensor] = {}
+    from fusezap.helpers import getenv
+    # NEURON + bf16 (I96 W1): 2-D linear weights K-major (relaid on the host), for neuron_kv.matmul_bf16
+    self.kmajor = _neuron(self.device) and dtype == dtypes.bfloat16 and bool(getenv("FZ_KLEIN_NEURON_BF16MM", 1))
     for k in sorted(want):   # one tensor at a time: its host copy is dropped once the device holds it
-      self.w[k] = Tensor(to_dtype(weights[k], dtype), device=self.device, dtype=dtype).realize()
+      a = to_dtype(weights[k], dtype)
+      if self.kmajor and a.ndim == 2: a = np.ascontiguousarray(a.T)
+      self.w[k] = Tensor(a, device=self.device, dtype=dtype).realize()
     self._tfreq = Tensor(timestep_freqs(cfg.timestep_channels), device=self.device).realize()
 
   def weight_names(self) -> list[str]:
@@ -164,7 +181,12 @@ class Flux2Transformer:
     return Tensor(cos, device=self.device).realize(), Tensor(sin, device=self.device).realize()
 
   # ---- building blocks (diffusers module order)
-  def _lin(self, x: Tensor, name: str) -> Tensor: return x.linear(self.w[name])
+  def _lin(self, x: Tensor, name: str) -> Tensor:
+    if getattr(self, "kmajor", False):   # NEURON bf16: w is (in, out) bf16; float32 result rounded to x's dtype like x.linear
+      from fusezap.serve.neuron_kv import matmul_bf16
+      y = matmul_bf16(x, self.w[name])
+      return y.cast(x.dtype) if x.dtype != dtypes.float32 else y
+    return x.linear(self.w[name])
   def _ln(self, x: Tensor) -> Tensor: return x.layernorm(-1, self.cfg.eps)
   def _rms(self, x: Tensor, name: str) -> Tensor:
     xf = x._upcast()
@@ -188,8 +210,9 @@ class Flux2Transformer:
   def _attn(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     """(B, S, H, D) x3 -> (B, S, H*D): non-causal SDPA in the (B, H, S, D) layout torch's native backend uses."""
     B, S, H, D = q.shape
-    o = sdpa(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3))
-    return o.permute(0, 2, 1, 3).reshape(B, S, H * D)
+    o = sdpa(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
+    if _neuron(o.device): o = o.contiguous()   # I96 W1: one strided view, so to_out / to_add_out reach the matmul kernel
+    return o.reshape(B, S, H * D)
   @staticmethod
   def _mod(m: Tensor, n: int) -> list[Tensor]:
     """Flux2Modulation.split: (B, 3n*D) -> 3n chunks (B, 1, D): (shift, scale, gate) per set."""
