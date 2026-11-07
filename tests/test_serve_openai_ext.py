@@ -247,6 +247,67 @@ def test_named_tool_choice_forces_the_call(fake):
   ch = r["choices"][0]
   assert ch["finish_reason"] == "stop" and ch["message"]["tool_calls"][0]["function"] == {"name": "get_weather", "arguments": '{"city": "Oslo"}'}
 
+def test_parallel_tool_calls_false_keeps_one_call(fake):
+  two = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Oslo"}}\n</tool_call>\n<tool_call>\n{"name": "get_time", "arguments": {}}\n</tool_call>'
+  url, eng, tok = fake(two)
+  msgs = [{"role": "user", "content": "Weather and time?"}]
+  names = lambda r: [c["function"]["name"] for c in r.json()["choices"][0]["message"]["tool_calls"]]
+  assert names(httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER, CLOCK]})) == ["get_weather", "get_time"]
+  assert names(httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER, CLOCK], "parallel_tool_calls": True})) == ["get_weather", "get_time"]
+  assert names(httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER, CLOCK], "parallel_tool_calls": False})) == ["get_weather"]
+  ev = _sse(httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER, CLOCK], "parallel_tool_calls": False, "stream": True}))
+  tc = [d["tool_calls"] for e in ev if "tool_calls" in (d := e["choices"][0]["delta"])]
+  assert len(tc) == 1 and len(tc[0]) == 1 and tc[0][0]["function"]["name"] == "get_weather"
+  rr = httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER], "parallel_tool_calls": "no"})
+  assert rr.status_code == 400 and rr.json()["error"]["param"] == "parallel_tool_calls"
+
+# a value of each unimplemented field that would change the output, and the neutral values clients send by default
+REJECTED = [("presence_penalty", 0.5), ("presence_penalty", -1), ("presence_penalty", False), ("frequency_penalty", 1.2),
+            ("logit_bias", {"15": -100}), ("best_of", 3), ("suffix", " end"), ("functions", [WEATHER["function"]]),
+            ("function_call", {"name": "get_weather"}), ("modalities", ["text", "audio"]), ("audio", {"voice": "alloy", "format": "wav"}),
+            ("web_search_options", {}), ("reasoning_effort", "high"), ("verbosity", "low"), ("min_p", 0.1), ("min_tokens", 5),
+            ("stop_token_ids", [13]), ("use_beam_search", True), ("include_stop_str_in_output", True), ("skip_special_tokens", False),
+            ("prompt_logprobs", 1), ("truncate_prompt_tokens", 8), ("guided_json", {"type": "object"}), ("guided_regex", "a+"),
+            ("guided_choice", ["a", "b"]), ("guided_grammar", "root ::= \"a\""), ("chat_template", "{{ messages }}"),
+            ("chat_template_kwargs", {"enable_thinking": False}), ("add_generation_prompt", False), ("continue_final_message", True)]
+NEUTRAL = {"presence_penalty": 0, "frequency_penalty": 0.0, "logit_bias": {}, "best_of": 1, "suffix": None, "functions": [],
+           "function_call": "auto", "modalities": ["text"], "audio": None, "web_search_options": None, "reasoning_effort": None,
+           "verbosity": "medium", "min_p": 0.0, "min_tokens": 0, "stop_token_ids": [], "use_beam_search": False,
+           "include_stop_str_in_output": False, "skip_special_tokens": True, "prompt_logprobs": None, "truncate_prompt_tokens": None,
+           "guided_json": None, "chat_template_kwargs": {}, "add_generation_prompt": True, "continue_final_message": False,
+           "top_k": -1, "parallel_tool_calls": True,
+           # informational: accepted, no effect on the output
+           "user": "u-1", "metadata": {"run": "a"}, "store": False, "service_tier": "auto", "prediction": {"type": "content", "content": "x"},
+           "prompt_cache_key": "k", "safety_identifier": "s", "stream_options": {"include_usage": True, "include_obfuscation": False}}
+
+def test_unsupported_parameters_rejected(fake):
+  """A field that would change the output and is not implemented is a 400 unsupported_parameter naming it, on both
+  endpoints and also for a stream (an HTTP error before any event); neutral values and informational fields pass."""
+  url, eng, tok = fake(" Paris.")
+  bodies = {"/v1/chat/completions": {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4},
+            "/v1/completions": {"prompt": "The capital of France is", "max_tokens": 4}}
+  for path, base in bodies.items():
+    for stream in (False, True):
+      r = httpx.post(url + path, json={**base, **NEUTRAL, "stream": stream})
+      assert r.status_code == 200, (path, stream, r.text)
+      if stream: assert r.text.rstrip().endswith("data: [DONE]")
+      else: ch = r.json()["choices"][0]; assert (ch["message"]["content"] if "message" in ch else ch["text"]) == " Paris."
+      n0 = eng.n
+      for k, v in REJECTED:
+        r = httpx.post(url + path, json={**base, k: v, "stream": stream})
+        assert r.status_code == 400 and r.headers["content-type"].startswith("application/json"), (path, k, v, stream)
+        e = r.json()["error"]
+        assert e == {"message": e["message"], "type": "invalid_request_error", "param": k, "code": "unsupported_parameter"}, (path, k, e)
+        assert e["message"].startswith(f"{k} is not supported by FuseZap Serve yet; "), e
+      assert eng.n == n0   # nothing rejected reached the engine
+  e = httpx.post(url + "/v1/chat/completions", json={**bodies["/v1/chat/completions"], "presence_penalty": 0.5}).json()["error"]
+  assert e["message"] == "presence_penalty is not supported by FuseZap Serve yet; send 0 or leave it out"
+  # best_of equal to n asks for nothing extra; min_tokens with ignore_eos (and no stop) is what ignore_eos already does
+  c = bodies["/v1/completions"]
+  assert httpx.post(url + "/v1/completions", json={**c, "n": 2, "best_of": 2}).status_code == 200
+  assert httpx.post(url + "/v1/completions", json={**c, "min_tokens": 4, "ignore_eos": True}).status_code == 200
+  assert httpx.post(url + "/v1/completions", json={**c, "min_tokens": 4, "ignore_eos": True, "stop": ["x"]}).status_code == 400
+
 def test_qwen_template_renders_tools_and_mistral_format():
   tok = _tok(QWEN)
   assert TL.tool_format(tok) == "hermes"

@@ -9,7 +9,7 @@ between steps (so concurrent requests join the running batch: continuous batchin
 back to the asyncio queue of its request. `ProcEngine` (the `fusezap serve` default on CUDA and NEURON) runs the same loop
 in a spawned engine process instead, so the HTTP work does not share a GIL with the engine's steps. Handlers detokenize
 incrementally, apply stop strings (aborting the engine request when one matches) and format chunks. Supported: max_tokens /
-max_completion_tokens, temperature (default 1.0, as OpenAI), top_p, top_k, seed, stop, n, repetition_penalty,
+max_completion_tokens, temperature (default 1.0, as OpenAI), top_p, top_k (0 or -1: off), seed, stop, n, repetition_penalty,
 stream_options.include_usage, logprobs (completions: `logprobs` k and `echo`, also for token-id prompts; chat: `logprobs` /
 `top_logprobs`; vLLM's `return_tokens_as_token_ids`; computed by a teacher-forced scoring pass, fusezap/serve/logprobs.py),
 chat `tools` / `tool_choice` (none, auto, required, a named function; Hermes, Mistral and Llama 3.1+ JSON formats parsed into
@@ -17,7 +17,11 @@ chat `tools` / `tool_choice` (none, auto, required, a named function; Hermes, Mi
 tool_choice (grammar-constrained decoding, fusezap/serve/constrain.py: needs the optional llguidance package, else 400).
 A streamed request with logprobs, echo or active Hermes / Mistral tools gets its chunks after generation finishes (the output
 must be complete to be scored or parsed); with Llama 3.1+ tools the stream is live until the output starts like a call
-(then that choice is held to its end and sent as tool_calls deltas: id, type and name first, then the arguments). Ignored: presence/frequency penalties, logit_bias.
+(then that choice is held to its end and sent as tool_calls deltas: id, type and name first, then the arguments).
+`parallel_tool_calls: false` keeps at most one tool call per choice. Fields that would change the output and are not
+implemented (presence / frequency penalties, logit_bias, best_of, suffix and the others in UNSUPPORTED) are a 400
+`unsupported_parameter` unless they carry their neutral value (0, null, {}, absent), so a request never gets a silently
+different result; informational fields (user, metadata, store, service_tier, ...) are accepted and have no effect.
 """
 from __future__ import annotations
 import asyncio, contextlib, json, os, queue, sys, threading, time, traceback, uuid
@@ -539,6 +543,42 @@ def _text(content: Any) -> str:
     if all(isinstance(p, dict) and p.get("type") == "text" for p in content): return "".join(p.get("text", "") for p in content)
   raise APIError("message content must be a string or a list of text parts", param="messages")
 
+# Request fields that change the output and are not implemented yet: (field, its neutral values or a predicate
+# (value, body) -> neutral, what to send instead). A neutral value, as SDKs and frameworks send by default, is accepted;
+# any other value is a 400 unsupported_parameter. Fields with no effect on the generated tokens (user, metadata, store,
+# service_tier, prediction, prompt_cache_key, safety_identifier, stream_options.include_obfuscation) are accepted.
+_ZERO, _OUT = "send 0 or leave it out", "leave it out"
+UNSUPPORTED: tuple[tuple[str, Any, str], ...] = (
+  ("presence_penalty", (None, 0), _ZERO), ("frequency_penalty", (None, 0), _ZERO),
+  ("logit_bias", (None, {}), "send {} or leave it out"),
+  ("best_of", lambda v, b: v in (None, 1, b.get("n") or 1), "send 1 or leave it out (n sets the number of choices)"),
+  ("suffix", (None, ""), "send an empty string or leave it out"),
+  ("functions", (None, []), "use tools instead"), ("function_call", (None, "none", "auto"), "use tool_choice instead"),
+  ("modalities", (None, ["text"]), 'send ["text"] or leave it out'), ("audio", (None,), _OUT),
+  ("web_search_options", (None,), _OUT),
+  ("reasoning_effort", (None, "medium"), 'send "medium" or leave it out'), ("verbosity", (None, "medium"), 'send "medium" or leave it out'),
+  # vLLM sampling and template extensions
+  ("min_p", (None, 0), _ZERO),
+  ("min_tokens", lambda v, b: v in (None, 0) or (b.get("ignore_eos") is True and not b.get("stop")), "send 0 or leave it out (or set ignore_eos)"),
+  ("stop_token_ids", (None, []), "use stop strings instead"),
+  ("use_beam_search", (None, False), "send false or leave it out"),
+  ("include_stop_str_in_output", (None, False), "send false or leave it out"),
+  ("skip_special_tokens", (None, True), "send true or leave it out"),
+  ("prompt_logprobs", (None,), "use /v1/completions with echo and logprobs instead"),
+  ("truncate_prompt_tokens", (None,), _OUT),
+  ("guided_json", (None,), "use response_format json_schema instead"), ("guided_regex", (None,), _OUT),
+  ("guided_choice", (None,), _OUT), ("guided_grammar", (None,), _OUT),
+  ("chat_template", (None,), _OUT), ("chat_template_kwargs", (None, {}), "send {} or leave it out"),
+  ("add_generation_prompt", (None, True), "send true or leave it out"), ("continue_final_message", (None, False), "send false or leave it out"),
+)
+
+def check_unsupported(body: dict) -> None:
+  """A 400 unsupported_parameter for the first UNSUPPORTED field with a value other than its neutral ones."""
+  for k, ok, hint in UNSUPPORTED:
+    v = body.get(k)
+    if not (ok(v, body) if callable(ok) else any(v is o if isinstance(v, bool) else v == o for o in ok)):   # false is not 0
+      raise APIError(f"{k} is not supported by FuseZap Serve yet; {hint}", param=k, code="unsupported_parameter")
+
 class Server:
   """engine: an LLMEngine (stepped on a worker thread, AsyncEngine) or a started ProcEngine."""
   def __init__(self, engine: LLMEngine | ProcEngine, tokenizer: Tokenizer, model_name: str, api_key: str | None = None):
@@ -574,7 +614,7 @@ class Server:
     if top_p <= 0: temp, top_p = 0.0, 1.0      # top_p=0 means "only the most likely token", i.e. greedy
     ignore_eos = body.get("ignore_eos", False)
     if not isinstance(ignore_eos, bool): raise APIError("'ignore_eos' must be a boolean", param="ignore_eos")
-    sp = SamplingParams(max_tokens=mt, temperature=temp, top_p=top_p, top_k=_num(body, "top_k", 0, 0, 1 << 30, int), repetition_penalty=rp, seed=seed,
+    sp = SamplingParams(max_tokens=mt, temperature=temp, top_p=top_p, top_k=0 if body.get("top_k") == -1 else _num(body, "top_k", 0, 0, 1 << 30, int), repetition_penalty=rp, seed=seed,
                         ignore_eos=ignore_eos)
     return sp, [s for s in stops if s]
 
@@ -665,6 +705,8 @@ class Server:
     as_ids = body.get("return_tokens_as_token_ids", False)
     if as_ids is None: as_ids = False
     if not isinstance(as_ids, bool): raise APIError("'return_tokens_as_token_ids' must be a boolean", param="return_tokens_as_token_ids")
+    if (ptc := body.get("parallel_tool_calls")) is not None and not isinstance(ptc, bool):
+      raise APIError("'parallel_tool_calls' must be a boolean", param="parallel_tool_calls")
     if chat:
       lp, top = body.get("logprobs", False), body.get("top_logprobs")
       if lp is None: lp = False
@@ -692,6 +734,7 @@ class Server:
     except Exception: raise APIError("request body is not valid JSON")
     if not isinstance(body, dict): raise APIError("request body must be a JSON object")
     self._check_model(body)
+    check_unsupported(body)
     ex = self._extras(body, chat)
     spec: TL.ToolSpec = ex["tools"]
     texts_in: list[str] = []   # completions: the prompt strings as given (echo)
@@ -731,6 +774,7 @@ class Server:
     stream = bool(body.get("stream"))
     # logprobs, echo and Hermes / Mistral tool calls need the whole output (to score or parse it): such a stream is sent once it is done
     buffered = ex["k"] is not None or ex["echo"] or (spec.active and not TL.streams_live(spec))
+    one_call = body.get("parallel_tool_calls") is False   # at most one tool call per choice (strict tools: also in the grammar)
     live_tools = spec.active and not buffered   # llama3_json: content streams live, a call is held to the end of its choice
     usage_in_stream = bool((body.get("stream_options") or {}).get("include_usage"))
     rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:24]
@@ -782,6 +826,7 @@ class Server:
           if spec.active:
             raw = spec.forced_prefix + (self.tok.decode(ids[i], skip_special_tokens=False) if spec.fmt == "mistral" else texts[i])
             calls, content = TL.parse(spec, raw)
+            calls = calls[:1] if one_call else calls
             if calls:
               msg = {"role": "assistant", "content": content, "tool_calls": calls}
               if fin == "stop" and spec.mode != "named": fin = "tool_calls"   # a named tool_choice finishes with "stop" (OpenAI, vLLM)
@@ -840,6 +885,7 @@ class Server:
       """A held llama3_json choice at its end: tool_calls deltas (per call: id, type, name and empty arguments, then the
       arguments) and finish_reason "tool_calls" (a named tool_choice: "stop"); not a call: the text as content."""
       calls, content = TL.parse(spec, spec.forced_prefix + text)
+      calls = calls[:1] if one_call else calls
       def ev(delta): return {"id": rid, "object": "chat.completion.chunk", "created": created, "model": self.name, "choices": [{"index": i, "delta": delta, "finish_reason": None}]}
       if not calls: return ([chunk(i, text, None)] if text else []) + [chunk(i, "", fin)]
       out = [ev({"content": content})] if content else []

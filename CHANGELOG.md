@@ -52,6 +52,10 @@ Nothing has been released yet. `scripts/release.py cut X.Y.Z` moves the Unreleas
 
 ### Changed
 
+- `fusezap serve` answers a request that sets an OpenAI or vLLM field it does not implement (presence / frequency
+  penalties, logit_bias, best_of, suffix, min_p and others) to a non-neutral value with a 400 `unsupported_parameter`
+  error naming the field, instead of ignoring it; neutral values (0, null, {}) are still accepted.
+  `parallel_tool_calls: false` now keeps at most one tool call, and `top_k: -1` means no top-k limit, as in vLLM.
 - The Core version moves from 0.0.1 to 0.1.0.dev0 (a pre-release; nothing is published yet). The version now has
   one source, `fusezap/_version.py`, read by the package metadata.
 
