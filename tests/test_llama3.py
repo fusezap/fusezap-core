@@ -125,9 +125,12 @@ def test_llama3_rope_tables_match_hf(fmt):
   cos, sin = rope_tables(c, 32768)
   hc_, hs_ = rot(torch.zeros(1, len(pos), 128), torch.tensor(pos)[None])
   # numpy's float32 pow and torch's differ by one ulp in 2 of the 64 base frequencies (the unscaled band; Qwen2.5-7B's theta
-  # 1e6 has one such frequency too): a one-ulp angle difference, which grows with the position (~1e-3 in sin at 32767)
-  atol = (2e-5 + 4e-8 * pos)[:, None]
-  assert (np.abs(cos[pos] - hc_[0, :, :64].numpy()) <= atol).all() and (np.abs(sin[pos] - hs_[0, :, :64].numpy()) <= atol).all()
+  # 1e6 has one such frequency too): a one-ulp angle difference, which grows with the position (~1e-3 in sin at 32767).
+  # torch's vectorised sin / cos also differ by CPU (x86 CI runners vary), so the bar has 3x headroom over that: a wrong
+  # scaling band or theta is off by O(1) at these positions, far above it.
+  atol = (2e-5 + 1.2e-7 * pos)[:, None]
+  dc, ds = np.abs(cos[pos] - hc_[0, :, :64].numpy()), np.abs(sin[pos] - hs_[0, :, :64].numpy())
+  assert (dc <= atol).all() and (ds <= atol).all(), f"max excess over the bar: cos {(dc - atol).max():.3g}, sin {(ds - atol).max():.3g}"
 
 # ---------------------------------------------------------------- EOS ids and the chat template
 
