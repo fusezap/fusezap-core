@@ -1,0 +1,88 @@
+[project]
+name = "fusezap"
+dynamic = ["version"]   # from fusezap/_version.py ([tool.hatch.version]); scripts/release.py bumps it
+description = "FuseZap Core: a small, compile-first engine for fast AI inference on any hardware"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Techyodl" }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+keywords = ["inference", "llm", "compiler", "cuda", "metal", "inferentia", "trainium"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = ["numpy>=2.0"]
+
+[project.scripts]
+fusezap = "fusezap.__main__:main"
+
+# release-history stores by URL scheme (fusezap/invarix_stores/registry.py); a plugin package registers its own here
+[project.entry-points."fusezap.invarix.stores"]
+sqlite = "fusezap.invarix_stores.sqlite:open"
+duckdb = "fusezap.invarix_stores.duckdb:open"
+postgresql = "fusezap.invarix_stores.postgresql:open"
+postgres = "fusezap.invarix_stores.postgresql:open"
+mysql = "fusezap.invarix_stores.mysql:open"
+
+[project.urls]
+Homepage = "https://fusezap.ai"
+Source = "https://github.com/fusezap/fusezap-core"
+Issues = "https://github.com/fusezap/fusezap-core/issues"
+Changelog = "https://github.com/fusezap/fusezap-core/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+metal = ["pyobjc-framework-Metal>=10.0"]
+serve = [
+    "huggingface-hub>=2.2.0",
+    "jinja2>=3.1",
+    "llguidance>=1.0",          # grammar-constrained decoding (response_format, strict tools): optional, no Python deps
+    "pillow>=11.0",
+    "safetensors>=0.8.0",
+    "starlette>=1.8.0",
+    "tokenizers>=0.23.3",
+    "uvicorn>=0.54.0",
+]
+# database drivers of the release-history stores (fusezap/invarix_stores; sqlite needs none)
+invarix-duckdb = ["duckdb>=1.1"]
+invarix-postgres = ["psycopg[binary]>=3.2"]
+invarix-mysql = ["PyMySQL>=1.1"]
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-xdist>=3",
+    "hypothesis>=6",
+    "torch>=2.4",
+    "transformers>=5.20.1",
+    "openai>=3.33.0",
+    "httpx>=0.28.1",
+    "pyyaml>=6.0",   # scripts/release.py, scripts/release_matrix.py
+    "diffusers>=0.42",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "fusezap/_version.py"
+
+# FuseZap Invarix (fusezap/invarix) is licensed separately and ships as its own compiled wheel (fusezap-invarix):
+# it is never part of the Apache-2.0 fusezap wheel or sdist.
+[tool.hatch.build.targets.wheel]
+packages = ["fusezap"]
+exclude = ["/fusezap/invarix", "__pycache__", "*.pyc"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["fusezap", "README.md", "LICENSE", "NOTICE"]
+exclude = ["/fusezap/invarix", "__pycache__", "*.pyc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

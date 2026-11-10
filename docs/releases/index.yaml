@@ -1,0 +1,33 @@
+# FuseZap release index (schema fusezap.releases/v1). One entry per published version, newest last.
+# `scripts/release.py cut X.Y.Z` appends the entry; `scripts/release.py check vX.Y.Z` requires it.
+# Nothing has been released yet: the list is empty on purpose.
+#
+# Fields (all required):
+#   version        X.Y.Z or X.Y.ZrcN (PEP 440, as fusezap.__version__); the git tag is v<version>
+#   date           build date: the day this version was cut (YYYY-MM-DD)
+#   line           the release line X.Y
+#   line_date      the day X.Y.0 first shipped. Same as `date` for X.Y.0; every patch on the line repeats it
+#   support        current | maintained | security | eol
+#                  (current = latest minor; maintained = N-1, gets fixes; security = Invarix line in its
+#                   6-month security window only; eol = no fixes). Updated on older entries when a new minor ships.
+#   invarix_maintenance_needed
+#                  the date Invarix maintenance must run to (or later) to use this build. It is the line date,
+#                  not the build date, so every patch on an entitled line reaches the customer.
+#   products       versions shipped together on the shared train: {core: X.Y.Z, invarix: X.Y.Z}
+#   notes          the release note, docs/releases/v<version>.md
+#   matrix         the frozen support matrix, docs/releases/matrix/v<version>.yaml
+#
+# Example (commented out; not a real release):
+# releases:
+#   - version: 0.2.0
+#     date: 2026-12-01
+#     line: "0.2"
+#     line_date: 2026-12-01
+#     support: current
+#     invarix_maintenance_needed: 2026-12-01
+#     products: {core: 0.2.0, invarix: 0.2.0}
+#     notes: docs/releases/v0.2.0.md
+#     matrix: docs/releases/matrix/v0.2.0.yaml
+
+schema: fusezap.releases/v1
+releases: []

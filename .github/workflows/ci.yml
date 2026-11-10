@@ -1,0 +1,52 @@
+# CPU tests for the public FuseZap Core repository. Hardware tiers (CUDA, METAL, NEURON) are not run here: they skip
+# without the hardware. The job runs only in the public repository (the private source repo carries the same file).
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-cpu:
+    if: github.repository == 'fusezap/fusezap-core'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      FZ_TEST_TIERS: interp,NPY,CPU
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang (the CPU backend compiles C with it)
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --extra serve
+      - name: Test
+        run: uv run pytest -n auto -q -rs
+
+  build:
+    if: github.repository == 'fusezap/fusezap-core'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build the wheel and sdist
+        run: uv build
+      - name: The wheel and sdist import and serve --help
+        run: |
+          uv venv /tmp/wheel-venv
+          uv pip install --python /tmp/wheel-venv/bin/python "$(ls dist/*.whl)[serve]"
+          /tmp/wheel-venv/bin/python -c "import fusezap; print(fusezap.__version__)"
+          /tmp/wheel-venv/bin/fusezap serve --help > /dev/null

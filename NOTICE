@@ -1,0 +1,11 @@
+FuseZap Core
+Copyright 2026 Techyodl
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+"FuseZap" and the FuseZap logo are trademarks of Techyodl. The Apache License does not grant permission to use
+them, except as required for reasonable and customary use in describing the origin of the work.
+
+This repository does not include third-party source code. Optional dependencies (for example PyTorch, Hugging Face
+tokenizers and transformers, llguidance, the NVIDIA CUDA runtime and the AWS Neuron SDK) are installed separately
+and are covered by their own licences.

@@ -1,0 +1,16 @@
+name: Performance
+description: Slower or uses more memory than it should
+labels: ["type/performance", "status/needs-triage"]
+body:
+  - type: textarea
+    id: numbers
+    attributes: {label: What you measured, description: "FuseZap's number, the baseline (engine and version) on the same machine, and the gap."}
+    validations: {required: true}
+  - type: textarea
+    id: how
+    attributes: {label: How to reproduce, description: "The exact commands for both (docs/BENCH_METHOD.md)."}
+    validations: {required: true}
+  - type: input
+    id: hw
+    attributes: {label: Hardware, placeholder: "GPU / chip, driver, host"}
+    validations: {required: true}

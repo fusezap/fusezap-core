@@ -1,0 +1,276 @@
+# FuseZap support matrix: the hand-maintained source (schema fusezap.matrix/v1).
+#
+# Rendered by scripts/release_matrix.py (markdown for release notes, JSON for the website /matrix page, an HTML
+# fragment) and validated by `scripts/release.py check`. `release.py cut X.Y.Z` freezes a copy as vX.Y.Z.yaml next
+# to this file; edit this file, never a frozen copy. Field reference: docs/releases/matrix/README.md.
+#
+# Status rules:
+#   Supported     from the first public release: passed a gate on real hardware (Invarix PROMOTE or a package gate), evidence resolves
+#   Preview       ran on real hardware in a development build (every cell until the first public release); gate and caveats in the cell
+#   Experimental  simulator or behind a flag only
+#   Planned       not run (no evidence, no metrics, no date promised)
+#
+# Evidence: a path in this repository, or "private: available on request" for evidence that exists
+# but is not published (raw run logs, FuseZap Invarix reports). Ask hello@fusezap.ai or open an issue.
+
+schema: fusezap.matrix/v1
+updated: 2026-11-04
+
+chips:
+  - {id: aws-inf2, name: AWS Inferentia2, vendor: AWS, backend: NEURON, hardware: "inf2 (NeuronCore-v2, 16 GiB HBM per core)"}
+  - {id: aws-trn1, name: AWS Trainium1, vendor: AWS, backend: NEURON, hardware: "trn1.2xlarge (NeuronCore-v2)"}
+  - {id: nvidia-h100, name: NVIDIA H100, vendor: NVIDIA, backend: CUDA, hardware: "H100 80GB HBM3 SXM"}
+  - {id: nvidia-h200, name: NVIDIA H200, vendor: NVIDIA, backend: CUDA, hardware: "H200 141 GB"}
+  - {id: nvidia-rtx4090, name: NVIDIA RTX 4090, vendor: NVIDIA, backend: CUDA, hardware: "GeForce RTX 4090 24 GB"}
+  - {id: apple-metal, name: Apple Silicon (Metal), vendor: Apple, backend: METAL, hardware: "Apple M5 Max"}
+  - {id: cpu, name: CPU, vendor: any, backend: CPU, hardware: "C backend (clang), measured on an Apple M5 Max host"}
+
+models:
+  - {id: qwen2.5-0.5b, name: Qwen2.5-0.5B-Instruct, hf: Qwen/Qwen2.5-0.5B-Instruct}
+  - {id: qwen2.5-7b, name: Qwen2.5-7B-Instruct, hf: Qwen/Qwen2.5-7B-Instruct}
+  - {id: qwen2.5-32b, name: Qwen2.5-32B-Instruct, hf: Qwen/Qwen2.5-32B-Instruct}
+  - {id: qwen2.5-72b, name: Qwen2.5-72B-Instruct, hf: Qwen/Qwen2.5-72B-Instruct}
+  - {id: llama-3.3-70b, name: Llama-3.3-70B-Instruct, hf: meta-llama/Llama-3.3-70B-Instruct}
+  - {id: flux.2-klein-4b, name: FLUX.2-klein-4B (image), hf: black-forest-labs/FLUX.2-klein-4B}
+
+cells:
+  # ------------------------------------------------------------------ AWS Inferentia2
+  - chip: aws-inf2
+    model: qwen2.5-7b
+    status: Preview
+    config: bf16, TP=2 (2 NeuronCores, inf2.8xlarge), fusezap serve --tp 2
+    verified: 2026-11-01
+    gate: Invarix accuracy + performance over HTTP (top-1 0.9987, greedy exact 0.9668), prewarm probe PASS
+    invarix: PROMOTE
+    build: "development build, 2026-11-01"
+    metrics:
+      - {name: TTFT p50 c1 (short), value: 55.4, unit: ms, baseline: "AWS NxD Inference TP=2: 50.6 ms"}
+      - {name: TPOT p50 c1, value: 38.8, unit: ms, baseline: "AWS NxD Inference TP=2: 40.6 ms"}
+      - {name: output tok/s c4 (short), value: 99.3, baseline: "AWS NxD Inference TP=2: 81.7"}
+    tested_with: {neuron_sdk: "2.33.0 (Deep Learning AMI Neuron, Ubuntu 24.04)", instance: inf2.8xlarge}
+    evidence:
+      - "private: available on request"
+    notes: Invarix perf ran 1 repeat, 8 requests per point. The AWS baseline is NxD Inference TP=2 run offline on the same instance type.
+
+  - chip: aws-inf2
+    model: qwen2.5-0.5b
+    status: Preview
+    config: fp32, 1 NeuronCore (inf2.xlarge), fusezap serve
+    verified: 2026-10-26
+    gate: Invarix accuracy over HTTP (top-1 1.0, greedy exact 1.0); 24/24 prompts token-exact vs the float32 reference
+    invarix: PROMOTE
+    metrics:
+      - {name: TPOT p50 c1 (HTTP), value: 27.1, unit: ms}
+    tested_with: {neuron_sdk: "2.33.0", instance: inf2.xlarge}
+    evidence:
+      - "private: available on request"
+    notes: Speed measured before the 27 Oct - 1 Nov NEURON kernel work; the c4 HTTP number in that run was polluted by an in-run compile and is not quoted.
+
+  # ------------------------------------------------------------------ AWS Trainium1
+  - chip: aws-trn1
+    model: qwen2.5-0.5b
+    status: Preview
+    config: fp32, 1 NeuronCore (trn1.2xlarge), fusezap serve
+    verified: 2026-10-27
+    gate: Invarix accuracy + performance (top-1 1.0, greedy exact 1.0), every server passed the correctness gate
+    invarix: PROMOTE
+    metrics:
+      - {name: TPOT p50 c1, value: 14.88, unit: ms, baseline: "AWS vLLM + vllm-neuron: 16.30 ms"}
+      - {name: output tok/s c4, value: 198.6, baseline: "AWS vLLM + vllm-neuron: 238.4"}
+    tested_with: {neuron_sdk: "2.33.0", instance: trn1.2xlarge}
+    evidence:
+      - "private: available on request"
+    notes: Slower than AWS's stack at c4 on this run. bf16 on trn1 was measured in process only (28 Oct) and is not in the matrix.
+
+  # ------------------------------------------------------------------ NVIDIA H100
+  - chip: nvidia-h100
+    model: qwen2.5-7b
+    status: Preview
+    config: bf16, 1 GPU, fusezap serve
+    verified: 2026-10-26
+    gate: Invarix accuracy + performance (top-1 0.9960), same pod as vLLM; earlier the SPEC throughput gate (>= 50% of vLLM) PASS on 22 Oct
+    invarix: PROMOTE
+    build: "development build, 2026-10-26"
+    metrics:
+      - {name: TPOT p50 c1, value: 5.57, unit: ms, baseline: "vLLM 0.32.0: 5.85 ms"}
+      - {name: TPOT p50 c32, value: 6.28, unit: ms, baseline: "vLLM 0.32.0: 6.23 ms"}
+      - {name: TTFT p50 c1, value: 12.4, unit: ms, baseline: "vLLM 0.32.0: 12.3 ms"}
+      - {name: output tok/s c32 (short), value: 4410.9, baseline: "vLLM 0.32.0: 4530.9"}
+    tested_with: {vllm: 0.32.0, driver: 595.91.07}
+    evidence:
+      - "private: available on request"
+      - docs/bench-h100.md
+    notes: One pod, 3 repeats per point. fp8 serves but is slower than bf16 at c32 (22 Oct); not a separate cell.
+
+  - chip: nvidia-h100
+    model: qwen2.5-32b
+    status: Preview
+    config: bf16 (and fp8), 1 GPU
+    verified: 2026-10-21
+    metrics:
+      - {name: output tok/s gate c1, value: 31.4, baseline: "vLLM 0.32.0: 40.1"}
+      - {name: output tok/s gate c32, value: 476.1, baseline: "vLLM 0.32.0: 805.3"}
+    tested_with: {vllm: 0.32.0}
+    evidence:
+      - "private: available on request"
+    notes: One same-pod measurement, no Invarix verdict, and it predates the 22-26 Oct speed work. Preview until a gated rerun.
+
+  # ------------------------------------------------------------------ NVIDIA H200 (two GPUs, tensor parallel)
+  - chip: nvidia-h200
+    model: llama-3.3-70b
+    status: Preview
+    config: bf16, TP=2 (2x H200), fusezap serve --tp 2
+    verified: 2026-10-26
+    gate: Invarix accuracy + performance (top-1 0.9993 vs float32), 3 repeats
+    invarix: PROMOTE
+    build: "development build, 2026-10-26"
+    metrics:
+      - {name: TPOT p50 c1, value: 20.12, unit: ms, baseline: "vLLM 0.32.0 TP=2: 19.48 ms"}
+      - {name: TPOT p50 c8, value: 20.56, unit: ms, baseline: "vLLM 0.32.0 TP=2: 20.74 ms"}
+      - {name: TPOT p50 c32, value: 21.99, unit: ms, baseline: "vLLM 0.32.0 TP=2: 21.18 ms"}
+    tested_with: {vllm: 0.32.0}
+    evidence:
+      - "private: available on request"
+    notes: "Accuracy + performance only; the full functional suite is not clean yet. Preview until it is."
+
+  - chip: nvidia-h200
+    model: qwen2.5-72b
+    status: Preview
+    config: bf16, TP=2 (2x H200), fusezap serve --tp 2
+    verified: 2026-10-25
+    gate: full Invarix suite (accuracy top-1 0.9933, functional, structured tools + JSON, performance, stability)
+    invarix: PROMOTE
+    build: "development build, 2026-10-25"
+    metrics:
+      - {name: TPOT p50 c1, value: 29.23, unit: ms}
+      - {name: output tok/s c32 (short), value: 889.7, baseline: "about 70% of vLLM 0.32.0 TP=2"}
+    tested_with: {vllm: 0.32.0}
+    evidence:
+      - "private: available on request"
+    notes: Speed predates the 26 Oct tensor-parallel all-reduce fix that brought Llama-3.3-70B level with vLLM; not re-measured on Qwen2.5-72B since.
+
+  # ------------------------------------------------------------------ NVIDIA RTX 4090
+  - chip: nvidia-rtx4090
+    model: qwen2.5-7b
+    status: Preview
+    config: bf16, 1 GPU (also TP=2 on 2x RTX 4090)
+    verified: 2026-10-25
+    gate: Invarix accuracy + performance, 1 repeat (top-1 0.996 TP=1, 0.998 TP=2)
+    invarix: PROMOTE
+    metrics:
+      - {name: TPOT p50 c1 (TP=1), value: 16.6, unit: ms}
+      - {name: "output tok/s c8 (TP=1, short)", value: 438.6}
+    evidence:
+      - "private: available on request"
+    notes: Invarix PROMOTE, but one repeat and no same-pod vLLM comparison, on a GPU outside the release gate set. Preview until it is in the release gate.
+
+  # ------------------------------------------------------------------ Apple Silicon
+  - chip: apple-metal
+    model: qwen2.5-0.5b
+    status: Preview
+    config: float32 / float16, fusezap serve --device METAL
+    verified: 2026-10-16
+    gate: package gates on the Mac (token-identical to HF for 64 tokens in f32; 32 concurrent requests equal to alone-greedy; OpenAI client end to end)
+    metrics:
+      - {name: decode tok/s batch 1 (f16), value: 149.2}
+      - {name: prefill tok/s 512 tokens (f16), value: 5323}
+    tested_with: {hardware: Apple M5 Max}
+    evidence:
+      - docs/status/B1-INT.md
+      - "private: available on request"
+    notes: Gated at integration on 16 Oct; the full test suite (all tiers) runs on the Mac at every integration since.
+
+  # ------------------------------------------------------------------ CPU
+  - chip: cpu
+    model: qwen2.5-0.5b
+    status: Preview
+    config: float32, C backend
+    verified: 2026-10-25
+    evidence:
+      - "private: available on request"
+    notes: "The op conformance suite and GPT parity are gated on CPU; for this model the only record is the 25 Oct tensor-parallel run notes that the tensor-parallel tests (Qwen2.5-0.5B greedy, FZ_SLOW=1) also pass on CPU. No CPU serving benchmark or Invarix run: Preview, not Supported."
+
+  # ------------------------------------------------------------------ Image generation (FLUX.2 [klein])
+  - chip: apple-metal
+    model: flux.2-klein-4b
+    status: Preview
+    config: bf16 transformer, float32 text encoder and VAE, fusezap serve-image flux2-klein --device METAL
+    verified: 2026-11-04
+    gate: "G6: at 1024x1024, closer (PSNR) to the float32 CPU image than diffusers bf16 on the same device, 8/8 prompts"
+    metrics:
+      - {name: mean PSNR dB vs float32 (diffusers 25.5), value: 33.9}
+      - {name: s per 1024x1024 image (diffusers 4.36), value: 53.1}
+    tested_with: {hardware: Apple M5 Max 48 GB}
+    evidence:
+      - docs/status/i81-flux2-klein-metal/README.md
+    notes: "About 12x slower than diffusers on MPS; images closer to the float32 ones."
+
+  - chip: nvidia-h100
+    model: flux.2-klein-4b
+    status: Preview
+    config: bf16 transformer, float32 text encoder and VAE, fusezap serve-image flux2-klein --device CUDA
+    verified: 2026-11-04
+    gate: "G6: at 1024x1024, closer (PSNR) to the float32 CPU image than diffusers bf16 on the same device, 8/8 prompts"
+    metrics:
+      - {name: mean PSNR dB vs float32 (diffusers 24.7), value: 32.7}
+      - {name: s per 1024x1024 image (diffusers 0.48), value: 3.15}
+    tested_with: {hardware: H100 80GB HBM3}
+    evidence:
+      - docs/status/i95-flux2-klein-cuda/README.md
+    notes: "About 7x slower than diffusers; the image decoder (no CUDA conv kernel yet) is over half the time."
+
+  - chip: nvidia-h200
+    model: flux.2-klein-4b
+    status: Preview
+    config: bf16 transformer, float32 text encoder and VAE, one GPU
+    verified: 2026-11-04
+    gate: "G6: at 1024x1024, closer (PSNR) to the float32 CPU image than diffusers bf16 on the same device, 8/8 prompts"
+    metrics:
+      - {name: mean PSNR dB vs float32 (diffusers 24.6), value: 32.7}
+      - {name: s per 1024x1024 image (diffusers 0.45), value: 3.63}
+    tested_with: {hardware: H200 141 GB}
+    evidence:
+      - docs/status/i95-flux2-klein-cuda/README.md
+    notes: "One H200 (the other H200 cells use two). Same images as on the H100; slower than the H100, not yet investigated."
+
+  - chip: nvidia-rtx4090
+    model: flux.2-klein-4b
+    status: Preview
+    config: bf16 transformer and VAE (the default under 40 GB), float32 text encoder loaded and released first
+    verified: 2026-11-04
+    gate: "G6: at 1024x1024, closer (PSNR) to the float32 CPU image than diffusers bf16 on the same device, 8/8 prompts"
+    metrics:
+      - {name: mean PSNR dB vs float32 (diffusers 24.5), value: 34.0}
+      - {name: s per 1024x1024 image (diffusers 1.36), value: 3.07}
+    tested_with: {hardware: GeForce RTX 4090 24 GB}
+    evidence:
+      - docs/status/i95-flux2-klein-cuda/README.md
+    notes: "About 2.3x slower than diffusers. The float32 VAE does not fit in 24 GB."
+
+  - chip: aws-inf2
+    model: flux.2-klein-4b
+    status: Preview
+    config: bf16 transformer on one NeuronCore (inf2.8xlarge), Neuron SDK 2.33.0; text encoder on the host CPU; float32 VAE decode scored on Apple METAL
+    verified: 2026-11-05
+    gate: "G3, G4 and G6 against the float32 diffusers CPU reference: 512x512 (1 prompt) and 1024x1024 (2 prompts), all passed (G6 bar 17 dB)"
+    metrics:
+      - {name: lowest PSNR dB vs float32 at 1024x1024 (2 prompts), value: 35.0}
+      - {name: s per denoising step at 1024x1024, value: 28}
+    tested_with: {hardware: inf2.8xlarge}
+    evidence:
+      - "private: available on request"
+    notes: "Correctness only, not speed yet. The transformer runs on the chip; the text encoder ran on the host and the image was decoded on a Mac for the check."
+
+  - chip: aws-trn1
+    model: flux.2-klein-4b
+    status: Preview
+    config: bf16 transformer on one NeuronCore (trn1.2xlarge), Neuron SDK 2.33.0; text encoder on the host CPU; float32 VAE decode scored on Apple METAL
+    verified: 2026-11-05
+    gate: "G3, G4 and G6 against the float32 diffusers CPU reference: 512x512 and 1024x1024, 2 prompts each, all passed (G6 bar 17 dB)"
+    metrics:
+      - {name: lowest PSNR dB vs float32 at 1024x1024 (2 prompts), value: 35.0}
+      - {name: s per denoising step at 1024x1024, value: 30}
+    tested_with: {hardware: trn1.2xlarge}
+    evidence:
+      - "private: available on request"
+    notes: "Correctness only, not speed yet. The transformer runs on the chip; the text encoder ran on the host and the image was decoded on a Mac for the check."

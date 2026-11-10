@@ -1,0 +1,14 @@
+name: New chip, backend or model family
+description: Propose support for a chip, backend or model family
+labels: ["type/new-backend", "status/needs-triage"]
+body:
+  - type: textarea
+    id: what
+    attributes: {label: What, and why it matters to you}
+    validations: {required: true}
+  - type: textarea
+    id: access
+    attributes: {label: Hardware access, description: "Can you run tests on it? Simulator, cloud instance, or your own lab?"}
+  - type: textarea
+    id: plan
+    attributes: {label: Approach, description: "Optional: how you'd build it. Large changes need agreement here before a pull request."}
