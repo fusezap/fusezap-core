@@ -51,3 +51,31 @@ jobs:
           uv pip install --python /tmp/wheel-venv/bin/python "$(ls dist/*.whl)[serve]"
           /tmp/wheel-venv/bin/python -c "import fusezap; print(fusezap.__version__)"
           /tmp/wheel-venv/bin/fusezap serve --help > /dev/null
+
+  dco:
+    # Developer Certificate of Origin: every commit in a pull request carries a Signed-off-by line that matches its
+    # author (git commit -s; CONTRIBUTING.md). Plain git, no third-party action; commit text is only read, never run.
+    name: DCO
+    if: github.event_name == 'pull_request' && contains(fromJSON('["fusezap/fusezap-core", "fusezap/fusezap-core-staging"]'), github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Every commit is signed off by its author
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          bad=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            author="$(git log -1 --format='%an <%ae>' "$c")"
+            if git log -1 --format=%B "$c" | grep -qiF "Signed-off-by: $author"; then
+              echo "ok   $c"
+            else
+              echo "::error::commit $c has no 'Signed-off-by: $author' line (use git commit -s)"; bad=1
+            fi
+          done
+          exit $bad
