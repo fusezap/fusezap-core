@@ -26,6 +26,9 @@ attention output is made contiguous before its projections (a permuted view is n
 pattern would not take it), and with bf16 weights every 2-D linear weight is kept K-major (in, out) in bf16 and runs
 through neuron_kv.matmul_bf16 (bf16 operands on TensorE, float32 accumulation), so no float32 weight copy is made per
 call. FZ_KLEIN_NEURON_BF16MM=0 keeps Tensor.linear (casts to float32, then the float32 matmul). Other devices unchanged.
+I93 speed switches (fusezap/codegen/nki_klein.py, both bitwise the paths they replace, default off): FZ_KLEIN_NEURON_ROPE=1
+(q / k cat + RoPE + attention layout as one RopeSpec launch each) and FZ_KLEIN_NEURON_MMG=<G> (bf16 linears with M >= 256
+as MatmulBF16G, one weight tile feeding up to G row blocks).
 """
 from __future__ import annotations
 import json, math, os
@@ -184,9 +187,27 @@ class Flux2Transformer:
   def _lin(self, x: Tensor, name: str) -> Tensor:
     if getattr(self, "kmajor", False):   # NEURON bf16: w is (in, out) bf16; float32 result rounded to x's dtype like x.linear
       from fusezap.serve.neuron_kv import matmul_bf16
-      y = matmul_bf16(x, self.w[name])
+      if (y := self._matmul_bf16g(x, self.w[name])) is None: y = matmul_bf16(x, self.w[name])
       return y.cast(x.dtype) if x.dtype != dtypes.float32 else y
     return x.linear(self.w[name])
+  def _matmul_bf16g(self, x: Tensor, w: Tensor) -> Tensor | None:
+    """I93 FZ_KLEIN_NEURON_MMG=<G>: neuron_kv.matmul_bf16 as nki_klein.MatmulBF16G (one weight tile feeds up to G row blocks;
+    bitwise MatmulBF16) for M >= 256 rows; None where it does not apply (the caller launches MatmulBF16)."""
+    from fusezap.codegen.nki_klein import MatmulBF16G, klein_mm_group
+    from fusezap.codegen.nki_kernels import A_KEEP, TK, TM
+    G, K, N = klein_mm_group(), int(w.shape[0]), int(w.shape[1])
+    M = int(np.prod(x.shape[:-1]))
+    if G < 2 or M < 256 or -(-K // TK) * TM * 4 > A_KEEP: return None
+    from fusezap.device import Buffer
+    from fusezap.device.neuron import NeuronCall
+    from fusezap.ir import ScheduleItem
+    from fusezap.serve.neuron_kv import _buf, _wrap
+    from fusezap import jit as J
+    if x.dtype != dtypes.float32: x = x.float()
+    xb = _buf(x)
+    out = Buffer(xb.device, M * N, dtypes.float32)
+    J.run_item(ScheduleItem((NeuronCall(MatmulBF16G(M, N, K, G)),), (out, xb, _buf(w)), {}, "custom", 1))
+    return _wrap(out, (*x.shape[:-1], N))
   def _ln(self, x: Tensor) -> Tensor: return x.layernorm(-1, self.cfg.eps)
   def _rms(self, x: Tensor, name: str) -> Tensor:
     xf = x._upcast()
@@ -213,6 +234,36 @@ class Flux2Transformer:
     o = sdpa(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
     if _neuron(o.device): o = o.contiguous()   # I96 W1: one strided view, so to_out / to_add_out reach the matmul kernel
     return o.reshape(B, S, H * D)
+  def _klein_rope(self) -> bool:
+    """I93 FZ_KLEIN_NEURON_ROPE=1 on a NEURON tier, with float32 attention (sdpa's NEURON cast): q / k RoPE as one RopeSpec
+    launch each, straight into the flash kernel's float32 (B, H, S, D) input (fusezap/codegen/nki_klein.py; bitwise the
+    composed _rope + permute + .float())."""
+    if not _neuron(self.device) or self.dtype not in (dtypes.bfloat16, dtypes.float32): return False
+    from fusezap.helpers import getenv
+    from fusezap.codegen.nki_klein import klein_rope
+    return klein_rope() and (self.dtype == dtypes.float32 or bool(getenv("FZ_KLEIN_ATTN_F32", 1)))
+  def _rope_heads(self, parts: list[Tensor], cos: Tensor, sin: Tensor) -> Tensor:
+    """RoPE of cat(parts, axis=1) (each (B, S_i, H, D) in the model dtype) as (B, H, S, D) float32: one RopeSpec launch."""
+    from fusezap.codegen.nki_klein import RopeSpec
+    from fusezap.device import Buffer
+    from fusezap.device.neuron import NeuronCall
+    from fusezap.ir import ScheduleItem
+    from fusezap.serve.neuron_kv import _buf, _wrap
+    from fusezap import jit as J
+    B, _, H, D = parts[0].shape
+    Ss = tuple(int(p.shape[1]) for p in parts)
+    bufs = [_buf(p) for p in parts]
+    out = Buffer(bufs[0].device, B * H * sum(Ss) * D, dtypes.float32)
+    sp = RopeSpec(int(B), Ss, int(H), int(D), "bf16" if self.dtype == dtypes.bfloat16 else "f32")
+    J.run_item(ScheduleItem((NeuronCall(sp),), (out, *bufs, _buf(cos), _buf(sin)), {}, "custom", 1))
+    return _wrap(out, (B, H, sum(Ss), D))
+  def _attn_hsd(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    """_attn with q, k already (B, H, S, D) float32 (from _rope_heads) and v (B, S, H, D): the same ops as sdpa's NEURON path."""
+    B, S, H, D = v.shape
+    vh = v.permute(0, 2, 1, 3)
+    o = q.scaled_dot_product_attention(k, vh.float() if vh.dtype != dtypes.float32 else vh)
+    if self.dtype != dtypes.float32: o = o.cast(self.dtype)
+    return o.permute(0, 2, 1, 3).contiguous().reshape(B, S, H * D)
   @staticmethod
   def _mod(m: Tensor, n: int) -> list[Tensor]:
     """Flux2Modulation.split: (B, 3n*D) -> 3n chunks (B, 1, D): (shift, scale, gate) per set."""
@@ -228,10 +279,13 @@ class Flux2Transformer:
     q, k = self._rms(q, p + "attn.norm_q.weight"), self._rms(k, p + "attn.norm_k.weight")
     eq, ek, ev = (self._heads(self._lin(nc, p + f"attn.add_{n}_proj.weight")) for n in "qkv")
     eq, ek = self._rms(eq, p + "attn.norm_added_q.weight"), self._rms(ek, p + "attn.norm_added_k.weight")
-    q, k, v = eq.cat(q, axis=1), ek.cat(k, axis=1), ev.cat(v, axis=1)
-    q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
     T = c.shape[1]
-    o = self._attn(q, k, v)
+    if self._klein_rope():   # I93: cat + RoPE + the attention layout in one launch per q / k
+      o = self._attn_hsd(self._rope_heads([eq, q], cos, sin), self._rope_heads([ek, k], cos, sin), ev.cat(v, axis=1))
+    else:
+      q, k, v = eq.cat(q, axis=1), ek.cat(k, axis=1), ev.cat(v, axis=1)
+      q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
+      o = self._attn(q, k, v)
     oc, ox = o[:, :T], o[:, T:]
     ox, oc = self._lin(ox, p + "attn.to_out.0.weight"), self._lin(oc, p + "attn.to_add_out.weight")
     x = x + g * ox
@@ -250,8 +304,10 @@ class Flux2Transformer:
     q, k, v, mlp = pr.split([D, D, D, 2 * M], -1)
     q, k, v = self._heads(q), self._heads(k), self._heads(v)
     q, k = self._rms(q, p + "norm_q.weight"), self._rms(k, p + "norm_k.weight")
-    q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
-    o = self._attn(q, k, v)
+    if self._klein_rope(): o = self._attn_hsd(self._rope_heads([q], cos, sin), self._rope_heads([k], cos, sin), v)
+    else:
+      q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
+      o = self._attn(q, k, v)
     out = self._lin(o.cat(self._swiglu(mlp), axis=-1), p + "to_out.weight")
     return h + g * out
 

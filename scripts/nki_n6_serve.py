@@ -37,7 +37,7 @@ from fusezap.device import Device
 from fusezap.dtype import dtypes
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SWITCHES = ("FZ_NEURON_DTYPE", "FZ_NEURON_BF16_ATTN", "FZ_NEURON_FUSE", "FZ_NEURON_FUSE_MAX", "FZ_NEURON_CTX", "FZ_NEURON_CTX_MIN", "FZ_NEURON_KT", "FZ_NEURON_AT_ROWS",
+SWITCHES = ("FZ_MOE_SPARSE", "FZ_MOE_TP", "FZ_MOE_IDMA", "FZ_MOE_SPARSE_ROWS", "FZ_DECODE_BUCKETS", "FZ_NEURON_DTYPE", "FZ_NEURON_BF16_ATTN", "FZ_NEURON_FUSE", "FZ_NEURON_FUSE_MAX", "FZ_NEURON_CTX", "FZ_NEURON_CTX_MIN", "FZ_NEURON_KT", "FZ_NEURON_AT_ROWS",
             "FZ_NKI_FAST_EXP", "FZ_NEURON_KVW", "FZ_NEURON_NORM", "FZ_NEURON_BATCH", "FZ_NEURON_HOSTFAST", "FZ_NEURON_DEVICE_ARGMAX",
             "FZ_NEURON_QWRITE_MAX", "FZ_NEURON_HEAD", "FZ_NEURON_HEAD_W", "FZ_NEURON_HEAD_DMAS", "FZ_NEURON_LAYER", "FZ_NEURON_LAYER_HEADS",
             "FZ_NEURON_LAYER_ROPE", "FZ_NEURON_LOW_BLOCKS", "FZ_NEURON_LAYER_MM", "FZ_NEURON_LAYER_EARLY", "FZ_NEURON_LAYER_PF", "FZ_NEURON_HEAD_FUSE",
@@ -46,7 +46,8 @@ SWITCHES = ("FZ_NEURON_DTYPE", "FZ_NEURON_BF16_ATTN", "FZ_NEURON_FUSE", "FZ_NEUR
             "FZ_NEURON_BF16_WN", "FZ_NEURON_BF16_PF", "FZ_NEURON_BF16_PFQO", "FZ_NEURON_BF16_HEAD", "FZ_NEURON_BF16_HEAD_W",   # N8 (I70)
             "FZ_NEURON_TP_LAYER", "FZ_NEURON_TP_AR_BIG", "FZ_NEURON_TP_PREFILL", "FZ_NEURON_TP_PREFILL_FUSE", "FZ_NEURON_PREFILL_CTX", "FZ_PREFILL_FIRST",   # I73 / I75
             "FZ_NEURON_PREFILL_KERNEL", "FZ_NEURON_PFK_EXP", "FZ_NEURON_PFK_HEAD", "FZ_NEURON_PFK_BANKS", "FZ_NEURON_PFK_WN", "FZ_NEURON_PFK_EVICT",
-            "FZ_NEURON_PREFILL_SIZES", "FZ_ADMIT_WAIT_MS", "FZ_NEURON_PREFILL_COST_MS", "FZ_PREFILL_FIT")   # I77
+            "FZ_NEURON_PREFILL_SIZES", "FZ_ADMIT_WAIT_MS", "FZ_NEURON_PREFILL_COST_MS", "FZ_PREFILL_FIT",   # I77
+            "FZ_NEURON_PFK_ATTN_HB", "FZ_NEURON_PFK_SILU", "FZ_NEURON_PFK_EXPF", "FZ_NEURON_EMBED_BF16")   # I69
 TP: list = []   # N8 --tp N: the tensor-parallel group (fusezap.serve.dist), rank 0 here
 OUT: dict = {}
 
@@ -355,6 +356,26 @@ def top1(eng, ref: dict, n_prompts: int) -> dict:
           "logprob_abs_err_mean": float(np.mean(err)) if err else None, "logprob_abs_err_max": float(np.max(err)) if err else None,
           "seconds": round(time.perf_counter() - t0, 1)}
 
+def decode_top1(m, ref: dict, n_prompts: int, n_tokens: int) -> dict:
+  """I105 A2: teacher-forced top-1 through the decode forward only (the engine's scorer runs prefill forwards, which an MoE
+  model keeps dense): Llama.reset, every prompt token and then the reference's greedy tokens fed one at a time through
+  Llama.decode (one row: the 1-row decode NEFFs), the argmax before each greedy token vs the reference's top-1 there."""
+  agree = total = 0
+  rows, t0 = [], time.perf_counter()
+  for q in ref["prompts"][:n_prompts]:
+    m.reset()
+    lg = None
+    for t in q["prompt_ids"]: lg = m.decode([[int(t)]])
+    am = []
+    for i, t in enumerate(q["greedy_ids"][:n_tokens]):
+      x = int(np.argmax(lg[0]))
+      am.append(x)
+      agree += int(x == q["topk_ids"][i][0]); total += 1
+      lg = m.decode([[int(t)]])
+    rows.append({"id": q["id"], "argmax": am})
+  return {"agree": agree, "positions": total, "agreement": round(agree / total, 5) if total else None, "rows": rows,
+          "seconds": round(time.perf_counter() - t0, 1)}
+
 def main() -> None:
   ap = argparse.ArgumentParser()
   ap.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
@@ -384,6 +405,9 @@ def main() -> None:
   ap.add_argument("--chunk-check", default="", help="I77: comma list of prompt lengths: each prompt alone under each prefill schedule "
                   "(auto / small / large forwards), the last prompt token's logits hash and the first --chunk-tokens tokens")
   ap.add_argument("--chunk-tokens", type=int, default=16)
+  ap.add_argument("--decode-top1", type=int, default=0, help="I105 A2: teacher-forced top-1 on the decode path for this many prompts "
+                  "(Llama.decode one token at a time: the prompt, then the reference's greedy tokens), argmax ids recorded")
+  ap.add_argument("--decode-top1-tokens", type=int, default=32)
   ap.add_argument("--no-prewarm", dest="prewarm", action="store_false",
                   help="skip the short c1 and c4 runs before measuring (their compiles and captures land in TTFT / the first steps); "
                        "the engine's own prewarm (NEURON, FZ_NEURON_PREWARM) still runs, so c1 is then the first request after start")
@@ -482,6 +506,9 @@ def main() -> None:
     if a.top1_prompts:
       OUT["top1"] = top1(eng, ref, a.top1_prompts)
       hbm(eng, "after top-1 scoring")
+  if a.decode_top1:
+    OUT["decode_top1"] = decode_top1(m, ref, a.decode_top1, a.decode_top1_tokens)
+    log(f"[{a.variant}] decode top1 {OUT['decode_top1']['agreement']} ({OUT['decode_top1']['agree']}/{OUT['decode_top1']['positions']}) in {OUT['decode_top1']['seconds']} s")
   OUT["neff"] = dict(neuron.NEFF_STATS)
   OUT["worker_calls_total"] = worker_calls()
   with open(os.path.join(a.out, f"serve_{a.variant}.json"), "w") as f: json.dump(OUT, f, indent=1, default=str)

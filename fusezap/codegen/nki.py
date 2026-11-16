@@ -87,17 +87,23 @@ LOG2_POLY = tuple(float(np.float32(2 / (LN2 * (2 * k + 1)))) for k in range(5)) 
 FLT_MAX_ = float(np.finfo(np.float32).max)
 FLT_MIN_ = float(np.finfo(np.float32).tiny)
 
-def exact_exp(emit, new, dst: str, x: str, base2: bool = True) -> None:
+def exact_exp(emit, new, dst: str, x: str, base2: bool = True, fused: bool = False) -> None:
   """dst = 2**x (base2) or e**x, float32 tiles, on VectorE. x is clamped (2**254 overflows to inf, 2**-252 underflows to 0),
   n = rint (a float -> int32 copy; the engines round to nearest even, a truncating one only widens |f| to < 1, which the
   degree-9 polynomial still covers), f = x - n exactly (base 2) or r = x - n*ln2 by Cody-Waite (base e), p = Horner on
   f, then p * 2**n1 * 2**n2 with n1 = rint(n/2), each power built from its exponent bits (so denormal results round once).
-  NaN is not handled here (the caller copies x back where x != x). `new(dtype)` declares a tile like x; `emit` writes a line."""
+  NaN is not handled here (the caller copies x back where x != x). `new(dtype)` declares a tile like x; `emit` writes a line.
+  fused (I69, the prefill kernels' FZ_NEURON_PFK_EXPF=1): the same values in 5 fewer instructions (of ~35), only where no rounding can
+  happen between the joined steps: the clamp as one two-op tensor_scalar (maximum, minimum: exact), and each power's exponent
+  bits (k + 127) * 2**23 as one two-op tensor_scalar written straight to int32 (integers below 2**31 with <= 24 significant
+  bits: exact in float32, so the int32 conversion is exact whatever its rounding mode)."""
   xc, n, f, p, s = (new(dtypes.float32) for _ in range(5))
   ni = new(dtypes.int32)
   lo, hi = (-252.0, 254.0) if base2 else (-175.0, 177.0)
-  emit(f"nisa.tensor_scalar(dst={xc}, data={x}, op0=nl.maximum, operand0={lo!r})")
-  emit(f"nisa.tensor_scalar(dst={xc}, data={xc}, op0=nl.minimum, operand0={hi!r})")
+  if fused: emit(f"nisa.tensor_scalar(dst={xc}, data={x}, op0=nl.maximum, operand0={lo!r}, op1=nl.minimum, operand1={hi!r})")
+  else:
+    emit(f"nisa.tensor_scalar(dst={xc}, data={x}, op0=nl.maximum, operand0={lo!r})")
+    emit(f"nisa.tensor_scalar(dst={xc}, data={xc}, op0=nl.minimum, operand0={hi!r})")
   if base2:
     emit(f"nisa.tensor_copy(dst={ni}, src={xc})")
     emit(f"nisa.tensor_copy(dst={n}, src={ni})")
@@ -120,9 +126,11 @@ def exact_exp(emit, new, dst: str, x: str, base2: bool = True) -> None:
   emit(f"nisa.tensor_copy(dst={s}, src={ni})")                                     # n1 = rint(n / 2)
   emit(f"nisa.tensor_tensor(dst={n}, data1={n}, data2={s}, op=nl.subtract)")       # n2 = n - n1; both in [-126, 127]
   for t, out in ((s, p), (n, dst)):   # 2**k = the float32 with exponent bits k + 127: (k + 127) * 2**23 is an exact int
-    emit(f"nisa.tensor_scalar(dst={t}, data={t}, op0=nl.add, operand0=127.0)")
-    emit(f"nisa.tensor_scalar(dst={t}, data={t}, op0=nl.multiply, operand0=8388608.0)")
-    emit(f"nisa.tensor_copy(dst={ni}, src={t})")
+    if fused: emit(f"nisa.tensor_scalar(dst={ni}, data={t}, op0=nl.add, operand0=127.0, op1=nl.multiply, operand1=8388608.0)")
+    else:
+      emit(f"nisa.tensor_scalar(dst={t}, data={t}, op0=nl.add, operand0=127.0)")
+      emit(f"nisa.tensor_scalar(dst={t}, data={t}, op0=nl.multiply, operand0=8388608.0)")
+      emit(f"nisa.tensor_copy(dst={ni}, src={t})")
     emit(f"{(v := new(None))} = {ni}.view(nl.float32)")
     emit(f"nisa.tensor_tensor(dst={out}, data1={p}, data2={v}, op=nl.multiply)")
 
@@ -237,6 +245,33 @@ class NKIProgram:
   n_bufs: int
   outs: tuple[int, ...]
   buf_dtypes: dict[int, DType]
+  dma_desc: int = 0   # renderer kernels: the DMA descriptor estimate of one launch (dma_descriptors); 0 = not estimated
+
+# ---------------------------------------------------------------- DMA descriptor budget (I105 B2)
+# The runtime builds every DMA of a NEFF into descriptor rings at load time, at most DMA_RING_MAX descriptors per ring
+# (inf2 chip run of 2026-11-14: `TDRV: Descriptor limit reached. Descriptors in vring 16777200, Max allowed 16777200`,
+# then NRT_FAILURE loading the NEFF). An HBM access pattern whose innermost step is not 1 (a transpose, a stride-0
+# broadcast) costs one descriptor per element; a contiguous run costs about one per partition row. The failing NEFF was
+# kmajor's float32 transpose of Gemma 3's lm_head (262144 x 1152 = 302 M strided elements in 4608 loads of 128 x 512):
+# ring qSPIO0_0 failed at dma block 4094 with 16777200 descriptors, ~4097 per block = 65536 / 16, so a launch's
+# descriptors spread over DMA_RINGS rings (a size match, not a documented constant). A renderer kernel whose estimate
+# exceeds DMA_RINGS x FZ_NEURON_DMA_DESC (default 3/4 of the ring limit: 12.6 M per ring) is launched as several NEFFs of
+# at most 2/3 of that each (half the ring limit), each over a range of its outermost independent loop
+# (NKIRenderer.render_split): the same instructions on disjoint outputs, so the same bits. The trigger leaves alone the
+# largest kernels that loaded on chips before: Qwen2.5-0.5B's float32 kmajor(lm_head) (8.5 M per ring, trn1 N7 step 2b) and
+# the scorer's 256-row log_softmax over Gemma's 262144 vocabulary (8.4 M per ring, inf2 chip run 1, bf16 and float32).
+DMA_RING_MAX = 16_777_200
+DMA_RINGS = 16
+
+def dma_budget() -> int:
+  """Estimated DMA descriptors above which a renderer launch is split (FZ_NEURON_DMA_DESC per ring x DMA_RINGS); 0 = never
+  (FZ_NEURON_DMA_SPLIT=0)."""
+  if os.environ.get("FZ_NEURON_DMA_SPLIT", "1") in ("0", ""): return 0
+  return DMA_RINGS * int(os.environ.get("FZ_NEURON_DMA_DESC", "") or DMA_RING_MAX * 3 // 4)
+
+def dma_part_budget(budget: int) -> int:
+  """The estimate each part of a split launch aims under: 2/3 of the trigger (default: half the ring limit per ring)."""
+  return max(1, budget * 2 // 3)
 
 @dataclass
 class _Acc:
@@ -305,8 +340,11 @@ def _view_acc(st: Any, full: tuple[int, ...], const: bool) -> _Acc:
   return a
 
 class _Kernel:
-  def __init__(self, ast: tuple[LazyOp, ...], var_vals: dict, pmax: int, fmax: int):
+  def __init__(self, ast: tuple[LazyOp, ...], var_vals: dict, pmax: int, fmax: int, split: tuple[str, int, int] | None = None):
     self.ast, self.vv, self.pmax, self.fmax = ast, var_vals, pmax, fmax
+    self.split = split            # (loop variable, start, stop): this launch covers that range of one independent loop
+    self.trips: list[tuple[int, int]] = []   # (depth of the loop header, trip count) of the open loops
+    self.desc: dict[int, int] = {}            # buffer -> estimated DMA descriptors of one launch
     self.lines: list[str] = []
     self.depth, self.ntile, self.nspan, self.scope = 1, 0, 0, 0
     self.span_names: dict[tuple, str] = {}   # (scope, start, ext, lo, hi) -> k of an emitted `ak, bk = ...` line
@@ -470,6 +508,7 @@ class _Kernel:
     """HBM <-> tile DMA. neuronx-cc rejects a negative partition step in an HBM access pattern (a flip of the partition
     axis), so that becomes one DMA per partition row (negative free-axis steps compile)."""
     sp = a.strides[self.pdim] if self.pdim is not None else 0
+    self._count(buf, a, spans)
     if sp >= 0:
       ap, sub = self._ap(buf, a, lvl, spans), self._sub_tile(t, spans)
       self._guarded(conds, f"nisa.dma_copy(dst={sub}, src={ap})" if load else f"nisa.dma_copy(dst={ap}, src={sub})")
@@ -670,9 +709,35 @@ class _Kernel:
     """A tile loop over `size` in steps of `step`: (start, extent) as ints when one tile covers it."""
     if size <= step: return 0, size
     ext = "pn" if var == "p0" else "fn"
-    self.open(f"for {var} in range(0, {size}, {step}):")
+    lo, hi = self._range(var, size)
+    self.open_loop(f"for {var} in range({lo}, {hi}, {step}):", -(-(hi - lo) // step))
     self.emit(f"{ext} = min({step}, {size} - {var})")
     return var, ext
+
+  def _range(self, var: str, size: int) -> tuple[int, int]:
+    return (self.split[1], self.split[2]) if self.split is not None and self.split[0] == var else (0, size)
+
+  def open_loop(self, header: str, trips: int) -> None:
+    while self.trips and self.trips[-1][0] >= self.depth: self.trips.pop()
+    self.trips.append((self.depth, trips))
+    self.open(header)
+
+  def splittable(self) -> list[tuple[str, int, int]]:
+    """(loop variable, size, step) of the loops whose iterations write disjoint outputs and read nothing another iteration
+    writes (the outer loops, the partition tiles, and the free-axis tiles of a kernel without a reduce), outermost first."""
+    if self.empty: return []
+    out = [(f"i{k}", self.sizes[d], 1) for k, d in enumerate(self.outer)]
+    if self.pdim is not None: out.append(("p0", self.sizes[self.pdim], self.pmax))
+    if self.fdim is not None and (self.red is None or self.red_noop or self.red_empty): out.append(("f0", self.sizes[self.fdim], self.fmax))
+    return [l for l in out if l[1] > l[2]]
+
+  def _count(self, buf: int, a: _Acc, spans: list[tuple[Any, Any, Any]]) -> None:
+    """Add one emitted HBM DMA's descriptor estimate (times the open loops' trips) to self.desc[buf]."""
+    rows = spans[0][1] if isinstance(spans[0][1], int) else min(self.pmax, self.sizes[self.pdim]) if self.pdim is not None else 1
+    cols = spans[1][1] if isinstance(spans[1][1], int) else min(self.fmax, self.sizes[self.fdim]) if self.fdim is not None else 1
+    sf = a.strides[self.fdim] if self.fdim is not None else 1
+    n = rows * (cols if sf != 1 and cols > 1 else 1)
+    self.desc[buf] = self.desc.get(buf, 0) + n * prod([t for d, t in self.trips if d < self.depth])
 
   def render(self, name: str) -> str:
     self.layout()
@@ -692,7 +757,8 @@ class _Kernel:
   def body(self) -> None:
     at: dict[int, Any] = {}
     for k, d in enumerate(self.outer):
-      self.open(f"for i{k} in range({self.sizes[d]}):")
+      lo, hi = self._range(f"i{k}", self.sizes[d])
+      self.open_loop(f"for i{k} in range({lo}, {hi}):" if (lo, hi) != (0, self.sizes[d]) else f"for i{k} in range({self.sizes[d]}):", hi - lo)
       at[d] = f"i{k}"
     p0, pn = self.loop("p0", self.sizes[self.pdim], self.pmax) if self.pdim is not None else (0, 1)
     if self.pdim is not None: at[self.pdim] = p0
@@ -727,7 +793,7 @@ class _Kernel:
     self.emit(f"nisa.memset(dst={acc}, value={ident})")
     pat = dict(at)
     for k, d in enumerate(self.rloops):
-      self.open(f"for r{k} in range({self.sizes[d]}):")
+      self.open_loop(f"for r{k} in range({self.sizes[d]}):", self.sizes[d])
       pat[d] = f"r{k}"
     f0, fn = self.loop("f0", F, self.fmax)
     pat[self.fdim] = f0
@@ -777,13 +843,39 @@ class NKIRenderer:
   def __init__(self, pmax: int = 128, fmax: int = 512):
     assert 1 <= pmax <= 128 and fmax >= 1
     self.pmax, self.fmax = pmax, fmax
-  def render(self, ast: tuple[LazyOp, ...], var_vals: dict | None = None, name: str | None = None) -> NKIProgram:
+  def render(self, ast: tuple[LazyOp, ...], var_vals: dict | None = None, name: str | None = None,
+             split: tuple[str, int, int] | None = None) -> NKIProgram:
+    prog, _ = self._render(ast, var_vals, name, split)
+    return prog
+
+  def _render(self, ast: tuple[LazyOp, ...], var_vals: dict | None, name: str | None, split: tuple[str, int, int] | None) -> tuple[NKIProgram, "_Kernel"]:
     ast = tuple(ast)
-    k = _Kernel(ast, var_vals or {}, self.pmax, self.fmax)
+    k = _Kernel(ast, var_vals or {}, self.pmax, self.fmax, split)
     name = name or kernel_name(ast, var_vals)
     src = k.render(name)
     bdt: dict[int, DType] = {}
     for n in [n for root in ast for n in root.walk()]:
       if n.op in (BufferOps.LOAD, BufferOps.STORE): bdt.setdefault(n.arg.idx, n.arg.dtype)
     for d in bdt.values(): nl_dtype(d)
-    return NKIProgram(name, src, k.n_bufs, k.outs, bdt)
+    return NKIProgram(name, src, k.n_bufs, k.outs, bdt, sum(k.desc.values())), k
+
+  def render_split(self, ast: tuple[LazyOp, ...], var_vals: dict | None = None, budget: int | None = None) -> tuple[NKIProgram, list[NKIProgram]]:
+    """(the whole kernel, its parts): parts is [] when the whole kernel's DMA descriptor estimate fits `budget` (default
+    dma_budget(); 0 = never split), else the launches that replace it, each over a contiguous range of tiles of one
+    splittable loop (_Kernel.splittable: the outermost with enough trips, else the one with the most), so every output
+    element is computed by the same instructions as in the whole kernel. Not split (parts []): a kernel that reads a
+    buffer it writes (a later part would read what an earlier one wrote) or with no splittable loop."""
+    prog, k = self._render(ast, var_vals, None, None)
+    budget = dma_budget() if budget is None else budget
+    if not budget or prog.dma_desc <= budget: return prog, []
+    if any(n.op is BufferOps.LOAD and n.arg.idx in prog.outs for root in ast for n in root.walk()): return prog, []
+    loops = k.splittable()
+    if not loops: return prog, []
+    need = -(-prog.dma_desc // dma_part_budget(budget))
+    trips = lambda l: -(-l[1] // l[2])
+    var, size, step = next((l for l in loops if trips(l) >= need), max(loops, key=trips))
+    n = min(need, trips((var, size, step)))
+    t = trips((var, size, step))
+    cuts = [i * t // n for i in range(n + 1)]
+    parts = [self._render(ast, var_vals, f"{prog.name}_s{i}of{n}", (var, cuts[i] * step, min(size, cuts[i + 1] * step)))[0] for i in range(n)]
+    return prog, parts

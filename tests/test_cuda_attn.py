@@ -99,7 +99,8 @@ def test_render_simt_source():
 
 def test_paged_params_match_kv_cache():
   from fusezap.serve import kv_cache
-  assert A.PAGED_PARAMS == kv_cache.ATTN_PARAMS
+  # I105 added "win" (sliding window) to the Metal / CPU kernel; the CUDA kernels refuse win != 0 and don't take it yet
+  assert A.PAGED_PARAMS + ("win",) == kv_cache.ATTN_PARAMS
 
 def test_kernel_choice():
   class D: cc = (9, 0)

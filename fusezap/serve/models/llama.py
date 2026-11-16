@@ -55,22 +55,49 @@ class LlamaConfig:
   eos_token_ids: list[int] = field(default_factory=list)
   bos_token_id: int | None = None
   model_type: str = "llama"
-  sliding_window: int | None = None    # only set when the checkpoint enables it (not implemented: see Llama.__init__)
+  sliding_window: int | None = None    # Mistral-style: every layer windowed (-> layer_windows)
   qk_norm: bool = False                # Qwen3: RMSNorm over head_dim on q and k (q_norm / k_norm weights), before RoPE
+  qk_norm_full: bool = False           # OLMoE (I105): q_norm / k_norm over the whole projection (all heads at once)
+  n_experts: int = 0                   # OLMoE (I105, models/moe.py): intermediate_size = n_experts * the expert width
+  top_k: int = 0
+  norm_topk: bool = False
+  # I105 B (models/swa.py): per layer sliding window (0 = full attention), the sliding layers' RoPE theta, layer variants
+  layer_windows: tuple | None = None
+  rope_local_theta: float | None = None
+  pre_norm: bool = True                # False: no input / pre-MLP RMSNorm (OLMo 3)
+  post_norm: bool = False              # RMSNorm on the attention and MLP outputs before the residual add (Gemma 3, OLMo 3)
+  norm_plus_one: bool = False          # RMSNorm weight (1 + w) (Gemma)
+  embed_scale: bool = False            # embeddings times sqrt(hidden_size) in the model dtype (Gemma)
+  act: str = "silu"                    # MLP activation: silu or gelu_pytorch_tanh (Gemma)
+  attn_scale: float | None = None      # attention scale (Gemma: query_pre_attn_scalar ** -0.5); None: head_dim ** -0.5
+  @property
+  def plain(self) -> bool:
+    """The layer shape the NEURON fast kernels (LayerSpec, prefill kernels v2) and CUDA fused paths are written for."""
+    return not (self.n_experts or self.qk_norm or self.layer_windows or self.post_norm or not self.pre_norm or self.act != "silu"
+                or self.rope_local_theta is not None or self.attn_scale is not None)
   @staticmethod
   def from_hf(c: dict) -> "LlamaConfig":
-    assert c.get("hidden_act", "silu") == "silu", f"unsupported activation {c.get('hidden_act')}"
+    act = c.get("hidden_activation") or c.get("hidden_act", "silu")
+    assert act in ("silu", "gelu_pytorch_tanh"), f"unsupported activation {act}"
+    moe = c.get("model_type") == "olmoe"   # I105: the experts as one dense SwiGLU of width E * Ie, masked (models/moe.py)
+    if moe: assert c.get("clip_qkv") is None, "OLMoE clip_qkv is not implemented"
+    E = int(c.get("num_experts") or 0) if moe else 0
     eos = c.get("eos_token_id")
     rp = c.get("rope_parameters") or {}   # transformers >= 5 keeps rope_theta and the scaling dict here
     theta = c.get("rope_theta") or rp.get("rope_theta") or 10000.0
     scaling = c.get("rope_scaling") or ({k: v for k, v in rp.items() if k != "rope_theta"} if rp.get("rope_type", "default") != "default" else None)
-    return LlamaConfig(c["hidden_size"], c["intermediate_size"], c["num_hidden_layers"], c["num_attention_heads"],
+    cfg = LlamaConfig(c["hidden_size"], c["intermediate_size"] * max(E, 1), c["num_hidden_layers"], c["num_attention_heads"],
       c.get("num_key_value_heads") or c["num_attention_heads"], c.get("head_dim") or c["hidden_size"] // c["num_attention_heads"],
       c["vocab_size"], c.get("rms_norm_eps", 1e-6), float(theta), scaling,
       bool(c.get("tie_word_embeddings", False)), c.get("max_position_embeddings", 4096),
       [eos] if isinstance(eos, int) else list(eos or []), c.get("bos_token_id"), c.get("model_type", "llama"),
       c.get("sliding_window") if c.get("use_sliding_window", c.get("model_type") == "mistral") else None,
-      c.get("model_type") == "qwen3")
+      c.get("model_type") in ("qwen3", "olmoe"), moe, E, int(c.get("num_experts_per_tok") or 0) if moe else 0, bool(c.get("norm_topk_prob")) and moe)
+    from fusezap.serve.models.swa import extras   # I105 B: Gemma 3 / OLMo 3 layer variants and sliding windows
+    import dataclasses
+    cfg = dataclasses.replace(cfg, **extras(c))
+    if cfg.sliding_window: cfg.layer_windows = (int(cfg.sliding_window),) * cfg.n_layers   # Mistral-style: every layer
+    return cfg
 
 def rope_inv_freq(cfg: LlamaConfig) -> np.ndarray:
   """float32 inverse frequencies, computed like HF (`1 / theta ** (arange(0, d, 2) / d)` in float32)."""
@@ -86,13 +113,36 @@ def rope_inv_freq(cfg: LlamaConfig) -> np.ndarray:
     out = np.where(wl > old / lo, inv / f, inv)
     mid = (wl <= old / lo) & (wl >= old / hi)
     inv = np.where(mid, (1 - smooth) * out / f + smooth * out, out).astype(np.float32)
+  elif kind == "yarn":   # I105 B (OLMo 3's full layers): models/swa.py
+    from fusezap.serve.models.swa import yarn_inv_freq
+    inv = yarn_inv_freq(cfg.rope_theta, d, rs, cfg.max_position)[0]
   elif kind not in (None, "default"): raise NotImplementedError(f"rope_scaling {rs}")
   return inv
 
 def rope_tables(cfg: LlamaConfig, max_len: int) -> tuple[np.ndarray, np.ndarray]:
   """(max_len, head_dim/2) cos and sin, float32 (HF: freqs = pos * inv_freq in float32, then cos/sin)."""
   fr = np.arange(max_len, dtype=np.float32)[:, None] * rope_inv_freq(cfg)[None, :]
+  rs = cfg.rope_scaling or {}
+  if rs.get("rope_type", rs.get("type")) == "yarn":   # HF: cos and sin times the attention factor
+    from fusezap.serve.models.swa import yarn_inv_freq
+    af = np.float32(yarn_inv_freq(cfg.rope_theta, cfg.head_dim, rs, cfg.max_position)[1])
+    return (np.cos(fr) * af).astype(np.float32), (np.sin(fr) * af).astype(np.float32)
   return np.cos(fr).astype(np.float32), np.sin(fr).astype(np.float32)
+
+def rope_local_tables(cfg: LlamaConfig, max_len: int) -> tuple[np.ndarray, np.ndarray] | None:
+  """I105 B: the sliding layers' own (max_len, head_dim/2) tables (rope_local_theta, no scaling), None if they share the global ones."""
+  if cfg.rope_local_theta is None: return None
+  import dataclasses
+  return rope_tables(dataclasses.replace(cfg, rope_theta=cfg.rope_local_theta, rope_scaling=None), max_len)
+
+def rope_host(cfg: LlamaConfig, max_len: int, neuron: bool = False) -> tuple[np.ndarray, np.ndarray]:
+  """The engine's host RoPE rows: (global | local) side by side when the sliding layers have their own (Llama.rope_pair
+  splits them per layer); NEURON: each half doubled (neuron_kv.rope_rows)."""
+  pairs = [rope_tables(cfg, max_len)] + ([lt] if (lt := rope_local_tables(cfg, max_len)) is not None else [])
+  if neuron:
+    from fusezap.serve.neuron_kv import rope_rows
+    pairs = [rope_rows(*p) for p in pairs]
+  return np.concatenate([p[0] for p in pairs], -1), np.concatenate([p[1] for p in pairs], -1)
 
 # ---------------------------------------------------------------- KV cache
 
@@ -149,7 +199,9 @@ class ContiguousKVCache(KVCache):
 class _Layer:
   wqkv: Tensor; bqkv: Tensor | None; wo: Tensor; bo: Tensor | None; wgu: Tensor; bgu: Tensor | None; wd: Tensor; bd: Tensor | None
   ln1: Tensor; ln2: Tensor
-  qn: Tensor | None = None; kn: Tensor | None = None   # Qwen3 q_norm / k_norm (head_dim,)
+  qn: Tensor | None = None; kn: Tensor | None = None   # Qwen3 q_norm / k_norm (head_dim,); OLMoE (Hq*hd,) / (Hkv*hd,)
+  wr: Tensor | None = None   # I105 MoE router (n_experts, D) float32 (K-major on NEURON)
+  pn1: Tensor | None = None; pn2: Tensor | None = None   # I105 B post-attention / post-MLP RMSNorm (Gemma 3, OLMo 3)
 
 class _NoCache(KVCache):
   """Llama.encode's cache: keeps nothing, returns this step's own keys and values (positions [0, T))."""
@@ -203,9 +255,22 @@ class Llama:
       cfg = dataclasses.replace(cfg, n_layers=load_layers)
     self.beam = int(os.environ.get("FZ_BEAM", "0") or 0) if beam is None else beam
     self.tp, self.full_cfg = tp, cfg
+    # I105 expert parallelism (an MoE model with a group): each rank holds n_experts / world experts and everything else
+    # whole (attention, norms, router, lm_head), so only the expert MLP's output is all-reduced (moe.py)
+    self.ep = tp is not None and tp.world > 1 and cfg.n_experts > 0
+    self.ep_lo, self.moe_slice = 0, False
     if tp is not None and tp.world > 1:
       from fusezap.serve.dist import local_cfg, tp_slice
-      cfg = local_cfg(cfg, tp.world)
+      if self.ep:
+        assert cfg.n_experts % tp.world == 0, f"{cfg.n_experts} experts over {tp.world} ranks"
+        import dataclasses
+        self.ep_lo = tp.rank * cfg.n_experts // tp.world
+        from fusezap.serve.models.moe import tp_layout
+        # I105 A2 FZ_MOE_TP=slice (the default with FZ_MOE_SPARSE): every expert's columns [r Ie/W, (r+1) Ie/W) per rank
+        self.moe_slice = tp_layout() == "slice"
+        if self.moe_slice: assert (cfg.intermediate_size // cfg.n_experts) % tp.world == 0, "expert width over the ranks"
+        cfg = dataclasses.replace(cfg, intermediate_size=cfg.intermediate_size // tp.world)
+      else: cfg = local_cfg(cfg, tp.world)
     else: self.tp = None
     # I68: bf16 on NEURON (fusezap/codegen/nki_bf16.py): the linear weights are bf16 (K-major, relaid on the host), the
     # activations, norms, softmax and logits float32 (self.dtype); --dtype bfloat16 or FZ_NEURON_DTYPE=bf16 select it
@@ -218,21 +283,27 @@ class Llama:
     self.cfg, self.dtype, self.device = cfg, dtype, Device.canonicalize(device)
     self.max_len, self.prefill_chunk = max_len, min(prefill_chunk, max_len)
     dev, c = self.device, cfg
-    if c.sliding_window is not None and max_len > c.sliding_window:
-      raise NotImplementedError(f"sliding-window attention (window {c.sliding_window}) is not implemented; use max_len <= window")
-    if c.qk_norm and _isn(device or Device.DEFAULT):
-      raise NotImplementedError("q/k RMSNorm (Qwen3) is not in the NEURON kernels yet (I81 D10)")
-    def W(name: str) -> np.ndarray: return weights[name] if self.tp is None else tp_slice(name, weights[name], self.full_cfg, tp.rank, tp.world)
+    if not c.plain and (_cu_dev := Device.canonicalize(device or Device.DEFAULT).split(":")[0].upper()) == "CUDA" and c.layer_windows:
+      raise NotImplementedError("sliding-window attention is not in the CUDA paged kernels (I105)")
+    if c.qk_norm_full and self.tp is not None and not self.ep:   # the q/k norm spans every rank's heads (OLMo 3)
+      raise NotImplementedError("q/k norm over all heads under tensor parallelism is not implemented (I105)")
+    def W(name: str) -> np.ndarray: return weights[name] if self.tp is None or self.ep else tp_slice(name, weights[name], self.full_cfg, tp.rank, tp.world)
     def T(a: np.ndarray, host: bool = False) -> Tensor:   # host=True: `a` is already in dtype's host format
       return Tensor(a if host else to_dtype(a, dtype), device=dev, dtype=dtype).realize()
-    def cat(names: list[str]) -> Tensor | None:          # fused projections: one matmul instead of two or three
+    def cat(names: list[str], axis: int = 0) -> Tensor | None:   # fused projections: one matmul instead of two or three
       if not all(n in weights for n in names): return None
-      return T(np.concatenate([to_dtype(W(n), dtype) for n in names], 0), host=True)
-    def TK(names: list[str]) -> Tensor | None:           # I68 NEURON bf16: a linear weight (or a fused one) bf16, K-major
-      if not all(n in weights for n in names): return None
-      if not self.nbf16: return cat(names) if len(names) > 1 else T(W(names[0]))
-      a = np.concatenate([to_dtype(W(n), dtypes.bfloat16) for n in names], 0)
+      return T(np.concatenate([to_dtype(W(n), dtype) for n in names], axis), host=True)
+    def TK(names: list[str], axis: int = 0, part: Any = None) -> Tensor | None:   # I68 NEURON bf16: a linear weight (or a fused one) bf16, K-major
+      if not all(n in weights for n in names): return None   # axis 1: stacked along the input (I105: the experts' down_proj)
+      R = (lambda n: W(n)) if part is None else part   # part(name): a slice of the tensor (I105 A2: the sliced expert layout)
+      if not self.nbf16:
+        if part is None: return cat(names, axis) if len(names) > 1 else T(W(names[0]))
+        return T(np.concatenate([to_dtype(R(n), dtype) for n in names], axis), host=True)
+      a = np.concatenate([to_dtype(R(n), dtypes.bfloat16) for n in names], axis)
       return Tensor(np.ascontiguousarray(a.T), device=dev, dtype=dtypes.bfloat16).realize()
+    def NT(name: str, W=W) -> Tensor | None:   # an RMSNorm weight; Gemma's (1 + w) in float32 first (I105 B); None if absent
+      if name not in weights: return None
+      return T((to_dtype(W(name), dtypes.float32) + np.float32(1)) if c.norm_plus_one else W(name))
     self.layers: list[_Layer] = []
     from fusezap.serve.weights import prefetch, release, close_prefetch
     by_layer: dict[int, list[str]] = {}
@@ -255,13 +326,40 @@ class Llama:
       l.wo, l.bo = TK([a + "o_proj.weight"]), (T(W(a + "o_proj.bias")) if a + "o_proj.bias" in weights else None)
       l.wgu, l.bgu = TK([m + "gate_proj.weight", m + "up_proj.weight"]), cat([m + "gate_proj.bias", m + "up_proj.bias"])
       l.wd, l.bd = TK([m + "down_proj.weight"]), (T(W(m + "down_proj.bias")) if m + "down_proj.bias" in weights else None)
-      l.ln1, l.ln2 = T(W(p + "input_layernorm.weight")), T(W(p + "post_attention_layernorm.weight"))
+      if c.n_experts:   # I105: every expert's gate rows, then every up row; down's columns in the same expert order (moe.py)
+        from fusezap.serve.models.moe import expert_names as ex
+        if self.moe_slice:   # I105 A2: every expert, this rank's Iw = Ie / W of its columns (gate / up rows, down columns)
+          Iw = c.intermediate_size // c.n_experts
+          rs = slice(tp.rank * Iw, (tp.rank + 1) * Iw)
+          l.wgu, l.bgu = TK(ex(m, c.n_experts, "gate") + ex(m, c.n_experts, "up"), part=lambda n: W(n)[rs]), None
+          l.wd, l.bd = TK(ex(m, c.n_experts, "down"), axis=1, part=lambda n: W(n)[:, rs]), None
+        else:
+          ne = c.n_experts // (tp.world if self.ep else 1)   # expert parallelism: this rank's experts [ep_lo, ep_lo + ne)
+          l.wgu, l.bgu = TK(ex(m, ne, "gate", self.ep_lo) + ex(m, ne, "up", self.ep_lo)), None
+          l.wd, l.bd = TK(ex(m, ne, "down", self.ep_lo), axis=1), None
+        l.wr = Tensor(to_dtype(W(m + "gate.weight"), dtypes.float32) if self.nbf16 else to_dtype(W(m + "gate.weight"), dtype), device=dev,
+                      dtype=dtypes.float32 if self.nbf16 else dtype).realize()   # NEURON bf16: the router stays float32
+      if not c.post_norm: l.ln1, l.ln2 = NT(p + "input_layernorm.weight"), NT(p + "post_attention_layernorm.weight")
+      else:   # I105 B: Gemma 3 input / pre_feedforward (pre-norms), post_attention / post_feedforward on the outputs; OLMo 3 the latter two
+        l.ln1, l.ln2 = NT(p + "input_layernorm.weight"), NT(p + "pre_feedforward_layernorm.weight")
+        l.pn1, l.pn2 = NT(p + "post_attention_layernorm.weight"), NT(p + "post_feedforward_layernorm.weight")
       if c.qk_norm:   # (head_dim,): the same on every tensor-parallel rank
-        l.qn, l.kn = T(weights[a + "q_norm.weight"]), T(weights[a + "k_norm.weight"])
+        l.qn, l.kn = NT(a + "q_norm.weight", W=lambda n: weights[n]), NT(a + "k_norm.weight", W=lambda n: weights[n])
       self.layers.append(l)
       release(lw(i - lag))
     for i in range(max(c.n_layers - lag, 0), c.n_layers): release(lw(i))
-    self.norm = T(W("model.norm.weight"))
+    if c.n_experts:
+      from fusezap.serve.models.moe import tie_order
+      self._moe_tri = tie_order(c.n_experts, dev)
+      if _isn(dev):   # NEURON: the routing weights widened on TensorE (moe.mix; this rank's experts under EP)
+        ne = c.n_experts // (tp.world if self.ep and not self.moe_slice else 1)
+        from fusezap.serve.models.moe import repeat_matrix, pair_matrices, sparse_enabled, upper_order
+        self._moe_rep = repeat_matrix(ne, c.intermediate_size // ne, dev)
+        self._moe_pairs = pair_matrices(c.n_experts, dev)
+        # I105 A2 (FZ_MOE_SPARSE): decode steps read only the chosen experts (one device, or the sliced layout under TP)
+        self.moe_sparse = sparse_enabled() and (not self.ep or self.moe_slice)
+        if self.moe_sparse: self._moe_upper = upper_order(c.n_experts, dev)
+    self.norm = NT("model.norm.weight")
     self.embed_host = W("model.embed_tokens.weight")    # host (mmap) table: token rows are gathered on the host
     if not lm_head: self._init_encoder_only(c, max_len, max_batch)
     if not lm_head: return
@@ -289,6 +387,8 @@ class Llama:
     self.table_len = max_len + self.prefill_chunk
     cos, sin = rope_tables(c, self.table_len)
     self.cos, self.sin = T(cos), T(sin)
+    lt = rope_local_tables(c, self.table_len)   # I105 B: the sliding layers' RoPE (Gemma 3: theta 1e4)
+    self.cos_l, self.sin_l = (T(lt[0]), T(lt[1])) if lt is not None else (self.cos, self.sin)
     self._pos = Tensor(np.arange(self.table_len, dtype=np.int32), device=dev).realize()
     self.max_batch = max_batch
     self.cache: KVCache = ContiguousKVCache(c.n_layers, max_batch, c.n_kv_heads, self.table_len, c.head_dim, dtype, dev, _pos=self._pos)
@@ -316,6 +416,10 @@ class Llama:
         # N7: lm_head for nki_kernels.HeadSpec, relaid on the host once (contiguous weight blocks per partition)
         self.lm_head_t = Tensor(head_tiles(self.lm_head.numpy()), device=dev).realize()
       else: self.lm_head_k = kmajor(self.lm_head)
+    if self.kmajor:   # I105: the MoE router, float32 K-major (also with bf16 weights)
+      from fusezap.device.neuron import kmajor as _km
+      for l in self.layers:
+        if l.wr is not None: l.wr = _km(l.wr)
     self._neuron_steps: Any = None   # NEURON: prefill/decode through the ragged forward (neuron_kv.NeuronSteps), built on first use
 
   def _init_encoder_only(self, c: LlamaConfig, max_len: int, max_batch: int) -> None:
@@ -327,8 +431,10 @@ class Llama:
     self.head_v, self.tp_vocab, self.neuron, self.kmajor, self.max_batch, self.pos = 0, False, False, False, max_batch, 0
     self.table_len = max_len
     cos, sin = rope_tables(c, max_len)
+    assert c.rope_local_theta is None, "encode() with per-layer RoPE is not implemented"
     self.cos = Tensor(to_dtype(cos, self.dtype), device=self.device, dtype=self.dtype).realize()
     self.sin = Tensor(to_dtype(sin, self.dtype), device=self.device, dtype=self.dtype).realize()
+    self.cos_l, self.sin_l = self.cos, self.sin
     self._pos = Tensor(np.arange(max_len, dtype=np.int32), device=self.device).realize()
     self.cuda16 = _cu.is_cuda(self.device) and self.dtype in _cu.HALVES and _cu.cc(self.device) >= (8, 0)
     self._encode_jits: dict[tuple[int, int, tuple[int, ...]], Jit] = {}
@@ -364,11 +470,11 @@ class Llama:
       from fusezap.serve.cuda import linear
       return linear(x, w, b, dtypes.float32 if w is self.lm_head else None, redo)
     return x.linear(w, b)
-  def _rowpar(self, x: Tensor, w: Any, b: Tensor | None, redo: tuple[int, int] | None = None, fuse: bool = False) -> Tensor:
+  def _rowpar(self, x: Tensor, w: Any, b: Tensor | None, redo: tuple[int, int] | None = None, fuse: bool = False, reduce: bool = True) -> Tensor:
     """A row-parallel projection (o_proj, down_proj): self.linear on one device; with tensor parallelism this rank's
     partial product, all-reduced over the ranks, then the bias once. fuse (I75, NEURON TP prefill): the all-reduce as a
     collective the fused member kernels may hold (dist.all_reduce)."""
-    if self.tp is None: return self.linear(x, w, b, redo)
+    if self.tp is None or not reduce: return self.linear(x, w, b, redo)   # reduce=False: a replicated projection (I105 EP: o_proj)
     from fusezap.serve.dist import all_reduce
     y = all_reduce(self.linear(x, w, None, redo), self.tp, fuse=fuse)
     return y if b is None else y + b
@@ -390,15 +496,22 @@ class Llama:
     y = _cu.linear(h, l.wqkv, None, dtypes.float32 if l.bqkv is not None and not _cu.bias_round2() else None, redo)
     return _cu.rope_qkv(y, l.bqkv, cos, sin, c.n_heads + 2 * c.n_kv_heads, c.n_heads + c.n_kv_heads, c.head_dim, kvw)
   def _flash(self, start: sint, T: sint, Sk: sint) -> bool:
-    return self.cuda16 and isinstance(start, int) and isinstance(T, int) and isinstance(Sk, int) and self.cfg.head_dim in (64, 128)
+    return self.cuda16 and isinstance(start, int) and isinstance(T, int) and isinstance(Sk, int) and self.cfg.head_dim in (64, 128) and self.cfg.plain
   def _rmsnorm(self, x: Tensor, w: Tensor) -> Tensor:
     xf = x.float()
     y = xf * ((xf * xf).mean(-1, keepdim=True) + self.cfg.rms_eps).rsqrt()
     return w * y.cast(x.dtype)
-  def _add_norm(self, x: Tensor, d: Tensor | None, w: Tensor) -> tuple[Tensor, Tensor]:
+  def _act(self, g: Tensor) -> Tensor: return g.gelu() if self.cfg.act == "gelu_pytorch_tanh" else g.silu()
+  def _post(self, y: Tensor, w: Tensor | None) -> Tensor:
+    """I105 B: a post-norm (Gemma 3 / OLMo 3: RMSNorm on a sublayer's output before the residual add); y itself without one."""
+    return y if w is None else self._rmsnorm(y, w)
+  def _add_norm(self, x: Tensor, d: Tensor | None, w: Tensor | None) -> tuple[Tensor, Tensor]:
     """(x + d, _rmsnorm(x + d, w)), or (x, _rmsnorm(x, w)) when d is None. CUDA f16/bf16: one fused row kernel
     (fusezap.serve.cuda.rmsnorm) that also writes the residual stream; the composed reduce re-read every earlier layer's
     residual terms, since the stream was never realized."""
+    if w is None:   # I105 B: no pre-norm (OLMo 3): the sublayer reads the residual stream itself
+      x = x if d is None else x + d
+      return x, x
     if self.cuda16 and (d is None or d.dtype == x.dtype):
       from fusezap.serve import cuda as _cu
       if _cu.rmsnorm_ok(x): return _cu.rmsnorm(x, w, self.cfg.rms_eps, d)
@@ -414,7 +527,14 @@ class Llama:
     return (x1 * cos + (-x2) * sin).cat(x2 * cos + x1 * sin, axis=-1)
   def embed(self, ids: np.ndarray) -> np.ndarray:
     """(B, T) token ids -> (B, T, D) host rows in the model dtype's host format."""
-    return to_dtype(self.embed_host[np.asarray(ids, np.int64)], self.dtype)
+    e = self.embed_host[np.asarray(ids, np.int64)]
+    if self.cfg.embed_scale:   # Gemma: rows times sqrt(hidden_size) rounded to the model dtype, one rounding of the product
+      from fusezap.serve.weights import bf16_to_f32, f32_to_bf16
+      sc = np.array([math.sqrt(self.cfg.hidden_size)], np.float32)
+      if self.dtype == dtypes.bfloat16: sc = bf16_to_f32(f32_to_bf16(sc))
+      elif self.dtype == dtypes.float16: sc = sc.astype(np.float16).astype(np.float32)
+      return to_dtype(to_dtype(e, dtypes.float32) * sc[0], self.dtype)
+    return to_dtype(e, self.dtype)
 
   def forward(self, x: Tensor, cache: KVCache, start: sint, T: sint, last_only: bool = True, last: sint | None = None,
               hiddens: list[Tensor] | None = None, head: bool = True, key_mask: Tensor | None = None, upto: int | None = None,
@@ -430,11 +550,13 @@ class Llama:
     c, B = self.cfg, x.shape[0]
     Hq, Hkv, hd = c.n_heads, c.n_kv_heads, c.head_dim
     G, S = Hq // Hkv, start + T
-    cos = self.cos.shrink(((start, S), None)).reshape(1, 1, T, hd // 2)
-    sin = self.sin.shrink(((start, S), None)).reshape(1, 1, T, hd // 2)
+    rows = lambda t: t.shrink(((start, S), None)).reshape(1, 1, T, hd // 2)
+    cos, sin = rows(self.cos), rows(self.sin)
+    cos_l, sin_l = (rows(self.cos_l), rows(self.sin_l)) if self.cos_l is not self.cos else (cos, sin)   # I105 B: sliding layers' RoPE
     qpos = self._pos.shrink(((start, S),)).reshape(T, 1)
-    scale = 1.0 / math.sqrt(hd)
-    mask: Tensor | None = None
+    scale = c.attn_scale or 1.0 / math.sqrt(hd)
+    wins = c.layer_windows or ()
+    masks: dict[int, Tensor] = {}   # per window size (0: causal only)
     d: Tensor | None = None   # the residual term not yet added to x
     # N8 (I71): fusion boundaries per layer on NEURON here too (the logprobs scorer's trunk): without them a captured pass
     # fused up to FZ_NEURON_FUSE_MAX items across layers into one NEFF, and its intermediates, all inside one launch, could
@@ -449,26 +571,39 @@ class Llama:
       q = qkv.shrink((None, None, (0, Hq * hd))).reshape(B, T, Hq, hd)
       k = qkv.shrink((None, None, (Hq * hd, (Hq + Hkv) * hd))).reshape(B, T, Hkv, hd)
       v = qkv.shrink((None, None, ((Hq + Hkv) * hd, (Hq + 2 * Hkv) * hd))).reshape(B, T, Hkv, hd).transpose(1, 2)
-      if l.qn is not None: q, k = self._rmsnorm(q, l.qn), self._rmsnorm(k, l.kn)   # Qwen3: per head, before RoPE
-      q, k = self._rope(q.transpose(1, 2), cos, sin), self._rope(k.transpose(1, 2), cos, sin)
+      if l.qn is not None and c.qk_norm_full:   # OLMoE: over all heads at once, before RoPE
+        q = self._rmsnorm(q.reshape(B, T, Hq * hd), l.qn).reshape(B, T, Hq, hd)
+        k = self._rmsnorm(k.reshape(B, T, Hkv * hd), l.kn).reshape(B, T, Hkv, hd)
+      elif l.qn is not None: q, k = self._rmsnorm(q, l.qn), self._rmsnorm(k, l.kn)   # Qwen3: per head, before RoPE
+      win = wins[i] if wins else 0
+      cs, sn = (cos_l, sin_l) if win else (cos, sin)
+      q, k = self._rope(q.transpose(1, 2), cs, sn), self._rope(k.transpose(1, 2), cs, sn)
       K, V = cache.update(i, k, v, start, T)                                  # (B, Hkv, Sk, hd), row j = position j
       Sk = K.shape[2]
       if key_mask is None and self._flash(start, T, Sk):   # CUDA flash attention: key j visible to query row l iff j <= start + l
         from fusezap.device.cuda_kernels.attention import attention as flash
         o = flash(q, K, V, causal=True, scale=scale, coff=start).transpose(1, 2).reshape(B, T, Hq * hd)
       else:
-        if i == 0 or mask is None:
-          mask = self._pos.shrink(((0, Sk),)).reshape(1, Sk) <= qpos   # key position <= query position
-          if key_mask is not None: mask = mask.reshape(1, 1, 1, T, Sk) * key_mask.reshape(B, 1, 1, 1, Sk)
+        if (mask := masks.get(win)) is None:   # key position <= query position (and inside the window, I105 B)
+          from fusezap.serve.models.swa import window_mask
+          mask = masks[win] = window_mask(self._pos.shrink(((0, Sk),)).reshape(1, Sk), qpos, win)
+          if key_mask is not None: mask = masks[win] = mask.reshape(1, 1, 1, T, Sk) * key_mask.reshape(B, 1, 1, 1, Sk)
         s = (q.reshape(B, Hkv, G, T, hd) @ K.reshape(B, Hkv, 1, Sk, hd).transpose(-1, -2)) * scale
         s = mask.where(s, float("-inf"))
         o = s.softmax(-1) @ V.reshape(B, Hkv, 1, Sk, hd)                        # (B, Hkv, G, T, hd)
         o = o.reshape(B, Hq, T, hd).transpose(1, 2).reshape(B, T, Hq * hd)
-      x, h = self._add_norm(x, self._rowpar(o, l.wo, l.bo), l.ln2)
+      # I105 B2: NEURON float32 (K-major weights): o_proj's input as one contiguous buffer. The transposed view has two
+      # views, so `o @ wo` did not match the TensorE matmul and ran as a composed MUL+SUM kernel that reads wo one element per
+      # DMA descriptor for every row (the scorer's 256-row bucket at Gemma 3's 1024 x 1152: 302 M descriptors in one NEFF).
+      # bf16 weights already materialize it (matmul_bf16).
+      if getattr(self, "kmajor", False) and not self.nbf16: o = o.contiguous()
+      x, h = self._add_norm(x, self._post(self._rowpar(o, l.wo, l.bo, reduce=not self.ep), l.pn1), l.ln2)
       gu = self.linear(h, l.wgu, l.bgu)
       I = c.intermediate_size
       g, u = gu.shrink((None, None, (0, I))), gu.shrink((None, None, (I, 2 * I)))
-      d = self._rowpar(g.silu() * u, l.wd, l.bd)
+      a = self._act(g) * u
+      if l.wr is not None: a = self._moe(h, a, l)   # I105: zero for the experts outside the row's top-k (moe.py)
+      d = self._post(self._rowpar(a, l.wd, l.bd), l.pn2)
       if cut_layers: x, d = _cut(x), _cut(d)   # eager encode: one layer's graph (and its temporaries) at a time
     if d is not None: x = x + d
     if upto is not None: return x
@@ -511,9 +646,18 @@ class Llama:
     fuse = ok16 and N >= _cu.fuse_rows()
     kvw = ok16 and _cu.rope_kvw_on() and getattr(cache, "kv_dest", None) is not None and cache.kv_dest(0) is not None
     def plain(w: Any) -> bool: return fuse and getattr(w, "apply", None) is None
-    def plain_qkv(w: Any) -> bool: return (fuse or kvw) and getattr(w, "apply", None) is None and not c.qk_norm
-    cos2, sin2 = cos, sin
-    if not getattr(cache, "rope_in_attend", False): cos, sin = cos.reshape(N, 1, h2), sin.reshape(N, 1, h2)   # NEURON: (N, hd) rows
+    def plain_qkv(w: Any) -> bool: return (fuse or kvw) and getattr(w, "apply", None) is None and c.plain
+    sc = c.attn_scale or 1.0 / math.sqrt(hd)
+    wins = c.layer_windows or ()
+    # I105 B: with per-layer RoPE the rows are (global | local) side by side (rope_host); a sliding layer takes the right half
+    if c.rope_local_theta is not None:
+      wd_ = cos.shape[-1] // 2
+      halves = [(t.shrink((None, (0, wd_))), t.shrink((None, (wd_, 2 * wd_)))) for t in (cos, sin)]
+      ropes = {0: (halves[0][0], halves[1][0]), 1: (halves[0][1], halves[1][1])}
+    else: ropes = {0: (cos, sin), 1: (cos, sin)}
+    def rope_of(i: int, flat: bool) -> tuple[Tensor, Tensor]:
+      cs, sn = ropes[1 if wins and wins[i] else 0]
+      return (cs, sn) if flat or getattr(cache, "rope_in_attend", False) else (cs.reshape(N, 1, h2), sn.reshape(N, 1, h2))   # NEURON: (N, hd) rows
     lay = getattr(cache, "layout", None)
     mix = getattr(lay, "mix", 0)   # LLMEngine mixed forward: rows >= mix are decode rows
     rd = (mix, N - mix) if mix and getattr(lay, "mix_exact", True) else None   # throughput mode: the prefill GEMM's bits will do
@@ -531,8 +675,8 @@ class Llama:
     if nfence: from fusezap.serve.neuron_kv import fence
     # N7 step 3: a layer as one LayerSpec (FZ_NEURON_LAYER). N8 TP (I72): a shard's layer is LayerSpec's two halves around
     # its two all-reduces (after o_proj and after down_proj); FZ_NEURON_TP_LAYER=members keeps the shard's member kernels
-    lv2 = nfence and getattr(self, "kmajor", False) and hasattr(cache, "layer") and \
-          (self.tp is None or os.environ.get("FZ_NEURON_TP_LAYER", "halves") != "members")
+    lv2 = nfence and getattr(self, "kmajor", False) and hasattr(cache, "layer") and c.plain and \
+          (self.tp is None or os.environ.get("FZ_NEURON_TP_LAYER", "halves") != "members")   # I105: other layer shapes: the members
     ar = None
     if self.tp is not None:
       from fusezap.serve.dist import all_reduce as _ar
@@ -548,13 +692,20 @@ class Llama:
     pfk, arf = None, None
     if nfence and getattr(lay, "prefill", False):
       from fusezap.serve import neuron_prefill as _pf
-      if _pf.enabled(): pfk = _pf
+      if _pf.enabled() and c.plain: pfk = _pf
       if pfk is not None: pk = _pf.big_fuse(int(N), pk)   # a 512-row chunk: groups of FZ_NEURON_PFK_FUSE_BIG layers per NEFF
       if pfk is not None and self.tp is not None:
         from fusezap.serve.dist import all_reduce as _ar2
         arf = lambda t: _ar2(t, self.tp, fuse=bool(pk))
+    # I105 A2: a decode forward (not a prefill chunk, not a mixed step) of at most moe.sparse_rows() rows on NEURON
+    sparse_ok = getattr(self, "moe_sparse", False) and getattr(self, "kmajor", False) and not getattr(lay, "prefill", False) and not mix
+    if sparse_ok:
+      from fusezap.serve.models.moe import sparse_rows
+      sparse_ok = isinstance(N, int) and N <= sparse_rows()
     for i, l in enumerate(self.layers):
       if nfence and i: d = fence(d, i, self.device, every=pk)
+      cos2, sin2 = rope_of(i, True)
+      cos, sin = rope_of(i, False)
       if pfk is not None and p is None and pfk.layer_ok(self, l, N, x):
         x, d = pfk.layer(cache, i, x, d, l, cos2, sin2, Hq, 1.0 / math.sqrt(hd), c.rms_eps, arf)
         continue
@@ -565,28 +716,40 @@ class Llama:
       else: x, h = self._add_norm(x, d, l.ln1)
       dest = None
       if getattr(cache, "rope_in_attend", False):   # NEURON (serve/neuron_kv.py): RoPE without cat, k / v written by a one-hot matmul
-        o = cache.attend_rope(i, self.linear(h, l.wqkv, l.bqkv, rd), cos2, sin2, Hq, 1.0 / math.sqrt(hd))
+        qkv = self._qk_full(self.linear(h, l.wqkv, l.bqkv, rd), l)
+        if l.qn is not None and not c.qk_norm_full: qkv = self._qk_heads(qkv, l)   # Gemma 3 / Qwen3 on the members: per head
+        o = cache.attend_rope(i, qkv, cos2, sin2, Hq, sc)
       elif plain_qkv(l.wqkv):
         dest = cache.kv_dest(i) if kvw else None
         qkv = self.qkv_rope_fused(h, l, cos2, sin2, rd, dest)
-        if dest is None: o = cache.attend(i, qkv, Hq, 1.0 / math.sqrt(hd))
+        if dest is None: o = cache.attend(i, qkv, Hq, sc)
       else:
-        qkv = self.linear(h, l.wqkv, l.bqkv, rd).reshape(N, Hq + 2 * Hkv, hd)
+        qkv = self._qk_full(self.linear(h, l.wqkv, l.bqkv, rd), l).reshape(N, Hq + 2 * Hkv, hd)
         qk, v = qkv.shrink((None, (0, Hq + Hkv), None)), qkv.shrink((None, (Hq + Hkv, Hq + 2 * Hkv), None))
-        if l.qn is not None:   # Qwen3: q_norm on the Hq query heads, k_norm on the Hkv key heads, before RoPE
+        if l.qn is not None and not c.qk_norm_full:   # Qwen3: q_norm on the Hq query heads, k_norm on the Hkv key heads, before RoPE
           qk = self._rmsnorm(qk.shrink((None, (0, Hq), None)), l.qn).cat(self._rmsnorm(qk.shrink((None, (Hq, Hq + Hkv), None)), l.kn), axis=1)
         x1, x2 = qk.shrink((None, None, (0, h2))), qk.shrink((None, None, (h2, hd)))
         qkv = (x1 * cos + (-x2) * sin).cat(x2 * cos + x1 * sin, axis=-1).cat(v, axis=1)   # the same RoPE expression as _rope
-        o = cache.attend(i, qkv, Hq, 1.0 / math.sqrt(hd))
-      if dest is not None: o = cache.attend(i, qkv, Hq, 1.0 / math.sqrt(hd), written=True)
-      if fz and l.bo is None: x, h = self._ar_add_norm(self.linear(o, l.wo, None, rd), x, l.ln2)
-      else: x, h = self._add_norm(x, self._rowpar(o, l.wo, l.bo, rd, fuse=bool(pk)), l.ln2)
+        o = cache.attend(i, qkv, Hq, sc)
+      if dest is not None: o = cache.attend(i, qkv, Hq, sc, written=True)
+      if fz and l.bo is None and l.pn1 is None and not self.ep: x, h = self._ar_add_norm(self.linear(o, l.wo, None, rd), x, l.ln2)
+      else: x, h = self._add_norm(x, self._post(self._rowpar(o, l.wo, l.bo, rd, fuse=bool(pk), reduce=not self.ep), l.pn1), l.ln2)
+      if l.wr is not None and sparse_ok:   # I105 A2: the chosen experts only (moe.moe_sparse; this rank's share under the sliced layout)
+        y = self._moe_sparse(h, l)
+        if fz and l.pn2 is None and i + 1 < len(self.layers): p, d = y, None
+        else:
+          if self.tp is not None:
+            from fusezap.serve.dist import all_reduce as _ar_y
+            y = _ar_y(y, self.tp, fuse=bool(pk))
+          p, d = None, self._post(y, l.pn2)
+        continue
       gu = self.linear(h, l.wgu, l.bgu, rd) if wide_linear is None else wl(h, l.wgu, l.bgu)
       I = c.intermediate_size
-      if plain(l.wgu) and l.bgu is None and _cu.silu_mul_ok(gu): a = _cu.silu_mul(gu)
-      else: a = gu.shrink((None, (0, I))).silu() * gu.shrink((None, (I, 2 * I)))
-      if fz and l.bd is None and i + 1 < len(self.layers): p, d = self.linear(a, l.wd, None, rd), None
-      else: p, d = None, self._rowpar(a, l.wd, l.bd, rd, fuse=bool(pk))
+      if plain(l.wgu) and l.bgu is None and c.act == "silu" and _cu.silu_mul_ok(gu): a = _cu.silu_mul(gu)
+      else: a = self._act(gu.shrink((None, (0, I)))) * gu.shrink((None, (I, 2 * I)))
+      if l.wr is not None: a = self._moe(h, a, l)   # I105
+      if fz and l.bd is None and l.pn2 is None and i + 1 < len(self.layers): p, d = self.linear(a, l.wd, None, rd), None
+      else: p, d = None, self._post(self._rowpar(a, l.wd, l.bd, rd, fuse=bool(pk)), l.pn2)
     if nfence: d = fence(d, len(self.layers), self.device, hard=True, every=pk)
     if getattr(self, "neuron", False) and not select: return self._vocab(wl(self._add_norm(x, d, self.norm)[1], self.lm_head, None))   # one norm kernel
     if d is not None: x = x + d
@@ -595,6 +758,27 @@ class Llama:
        self.lm_head.dtype == dtypes.bfloat16 and pfk.head_mode(self.tp is not None) != "off":   # I77: the prefill's head (FZ_NEURON_PFK_HEAD)
       return pfk.head(self, self._add_norm(x, None, self.norm)[1], arf)
     return self._vocab(wl(self._add_norm(x, None, self.norm)[1], self.lm_head, None))
+  def _qk_heads(self, qkv: Tensor, l: _Layer) -> Tensor:
+    """Per-head q_norm / k_norm (Qwen3, Gemma 3) on a flat (N, (Hq + 2 Hkv) hd) qkv row block, v unchanged."""
+    c = self.cfg
+    N, hd, Hq, Hkv = qkv.shape[0], c.head_dim, c.n_heads, c.n_kv_heads
+    y = qkv.reshape(N, Hq + 2 * Hkv, hd)
+    q, k, v = y.shrink((None, (0, Hq), None)), y.shrink((None, (Hq, Hq + Hkv), None)), y.shrink((None, (Hq + Hkv, Hq + 2 * Hkv), None))
+    return self._rmsnorm(q, l.qn).cat(self._rmsnorm(k, l.kn), v, axis=1).reshape(N, (Hq + 2 * Hkv) * hd)
+  def _qk_full(self, qkv: Tensor, l: _Layer) -> Tensor:
+    """OLMoE's q_norm / k_norm (I105) on a (N, (Hq + 2 Hkv) hd) qkv row block: RMSNorm over all of q's columns, then over
+    all of k's, before RoPE; v unchanged. Other models: qkv itself."""
+    if l.qn is None or not self.cfg.qk_norm_full: return qkv
+    c = self.cfg
+    nq, nk = c.n_heads * c.head_dim, c.n_kv_heads * c.head_dim
+    q, k, v = qkv.shrink((None, (0, nq))), qkv.shrink((None, (nq, nq + nk))), qkv.shrink((None, (nq + nk, nq + 2 * nk)))
+    return self._rmsnorm(q, l.qn).cat(self._rmsnorm(k, l.kn), v, axis=-1)
+  def _moe(self, h: Tensor, a: Tensor, l: _Layer) -> Tensor:
+    from fusezap.serve.models.moe import moe_act
+    return moe_act(self, h, a, l)
+  def _moe_sparse(self, h: Tensor, l: _Layer) -> Tensor:
+    from fusezap.serve.models.moe import moe_sparse
+    return moe_sparse(self, h, l)
   def _vocab(self, y: Tensor) -> Tensor:
     """N8 FZ_NEURON_TP_HEAD=vocab: this rank's logits columns -> every rank's full logits (neuron_tp.gather_cols)."""
     if not getattr(self, "tp_vocab", False): return y

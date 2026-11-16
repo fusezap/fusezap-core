@@ -329,7 +329,7 @@ def render_paged_flash(name: str, dt: DType, hd: int, G: int, NW: int = 4, BN: i
 
 DENSE_PARAMS = ("Bt", "Hq", "G", "L", "S", "sqb", "sqh", "sql", "sqd", "skb", "skh", "sks", "skd", "svb", "svh", "svs", "svd",
                 "sob", "soh", "sol", "sod", "oq", "ok", "ov", "coff", "scale_bits", "log2e_bits")
-PAGED_PARAMS = ("N", "Hkv", "bs", "NB", "MB", "xs", "mrow", "mpos", "mbt", "scale_bits")   # == kv_cache.ATTN_PARAMS
+PAGED_PARAMS = ("N", "Hkv", "bs", "NB", "MB", "xs", "mrow", "mpos", "mbt", "scale_bits")   # == kv_cache.ATTN_PARAMS minus "win" (I105: no sliding window on CUDA yet)
 
 _SIMT = Template(r"""static __device__ __forceinline__ float fz_wmax(float x) {
   for (int o = 16; o > 0; o >>= 1) { const float y = __shfl_xor_sync(0xffffffffu, x, o); x = y > x ? y : x; }

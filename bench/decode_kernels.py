@@ -63,8 +63,8 @@ def patch_ar() -> None:
       dev.allocator.copyout(host, inp.handle); dev.allocator.copyin(out.handle, host)
   class _G:   # what dist.all_reduce needs of a TPGroup
     comm = _Copy()
-  def rowpar(self, x, w, b, redo=None, fuse=False):
-    if self.tp is not None or os.environ.get("FZ_KPROF_AR", "") != "copy": return orig(self, x, w, b, redo, fuse)
+  def rowpar(self, x, w, b, redo=None, fuse=False, reduce=True):   # reduce (I105): Llama._rowpar's expert-parallel switch
+    if self.tp is not None or not reduce or os.environ.get("FZ_KPROF_AR", "") != "copy": return orig(self, x, w, b, redo, fuse, reduce)
     y = dist.all_reduce(self.linear(x, w, None, redo), _G())
     return y if b is None else y + b
   Llama._rowpar = rowpar

@@ -136,9 +136,78 @@ def test_late_arrivals_and_capacity():
 
 def test_prefill_sizes():
   from fusezap.serve.engine import prefill_sizes
-  assert prefill_sizes("CUDA", 2048) == [256, 512, 1024, 2048] and prefill_sizes("CUDA:1", 768) == [384, 768]
-  assert prefill_sizes("CUDA", 256) == [256] and prefill_sizes("CUDA", 128) == [128] and prefill_sizes("CUDA", 1000) == [500, 1000]
+  # W15 default: down to 128 (FZ_PREFILL_MIN=256 / min_rows=256: the sizes before)
+  assert prefill_sizes("CUDA", 2048) == [128, 256, 512, 1024, 2048] and prefill_sizes("CUDA:1", 768) == [192, 384, 768]
+  assert prefill_sizes("CUDA", 256) == [128, 256] and prefill_sizes("CUDA", 128) == [128] and prefill_sizes("CUDA", 1000) == [250, 500, 1000]
+  assert prefill_sizes("CUDA", 2048, min_rows=256) == [256, 512, 1024, 2048] and prefill_sizes("CUDA:1", 768, min_rows=256) == [384, 768]
+  assert prefill_sizes("CUDA", 256, min_rows=256) == [256] and prefill_sizes("CUDA", 1000, min_rows=256) == [500, 1000]
   for d in ("METAL", "CPU", "NPY"): assert prefill_sizes(d, 2048) == [2048] and prefill_sizes(d, 256) == [256]
+
+def test_prefill_sizes_min_128(monkeypatch):
+  """W15: 128-row CUDA prefill forwards by default (a 128-token prompt no longer pads to 256 rows); FZ_PREFILL_MIN=256
+  restores the old sizes; the floor stays above FZ_GEMM_SMALL_M (64), where the GEMMs would take the decode kernel's K
+  order; NEURON / METAL untouched. FZ_CUBLASLT_PER_M is on by default, 0 turns it off."""
+  from fusezap.device.cuda_kernels import cublaslt
+  from fusezap.serve import engine as E
+  from fusezap.helpers import getenv
+  assert E.prefill_min() == 128 and cublaslt.per_m_on()
+  monkeypatch.setenv("FZ_CUBLASLT_PER_M", "0"); monkeypatch.setenv("FZ_PREFILL_MIN", "256"); getenv.cache_clear()
+  assert not cublaslt.per_m_on() and E.prefill_min() == 256 and E.prefill_sizes("CUDA", 2048) == [256, 512, 1024, 2048]
+  monkeypatch.delenv("FZ_CUBLASLT_PER_M")
+  monkeypatch.setenv("FZ_PREFILL_MIN", "128"); getenv.cache_clear()
+  try:
+    assert E.prefill_min() == 128
+    assert E.prefill_sizes("CUDA", 2048) == [128, 256, 512, 1024, 2048] and E.prefill_sizes("CUDA:1", 256) == [128, 256]
+    assert E.prefill_sizes("METAL", 2048) == [2048]
+    assert E.prefill_sizes("CUDA", 2048, min_rows=256) == [256, 512, 1024, 2048]
+    monkeypatch.setenv("FZ_PREFILL_MIN", "32"); getenv.cache_clear()
+    assert E.prefill_min() == E.PREFILL_MIN_FLOOR == 128 and E.prefill_sizes("CUDA", 1024)[0] == 128
+    assert E.prefill_sizes("CUDA", 2048, min_rows=16)[0] == 128
+  finally:
+    monkeypatch.delenv("FZ_PREFILL_MIN"); getenv.cache_clear()
+
+def test_cublaslt_small_prefill_sizes_keep_the_pinned_algos(monkeypatch):
+  """W15: enable_cublaslt pins the algos over the sizes >= 256 exactly as before, then extends them to 128 only if the
+  same algos pass the bit self-check there; if not, the engine drops 128 (never a different algo)."""
+  from types import SimpleNamespace as NS
+  from fusezap.serve import engine as E
+  from fusezap.device.cuda_kernels import cublaslt
+  calls = {}
+  monkeypatch.setattr(cublaslt, "available", lambda: True)
+  monkeypatch.setattr(cublaslt, "enable", lambda dev, shapes, Ms, log=None, group="prefill": calls.setdefault("enable", list(Ms)) and {})
+  w = NS(shape=(64, 32))
+  lay = NS(wqkv=w, wo=w, wgu=w, wd=w, bqkv=None)
+  for ok in (True, False):
+    calls.clear()
+    monkeypatch.setattr(cublaslt, "extend", lambda dev, Ms, log=None, group="prefill", ok=ok: calls.setdefault("extend", list(Ms)) is not None and ok)
+    eng = NS(model=NS(dtype=E.dtypes.bfloat16, layers=[lay], device="CUDA"), prefill_sizes=[128, 256, 512], _prefills={128: 1, 256: 2, 512: 3})
+    eng.drop_prefill_sizes = lambda sizes, why, eng=eng: E.LLMEngine.drop_prefill_sizes(eng, sizes, why)
+    E.enable_cublaslt(eng)
+    assert calls["enable"] == [256, 512] and calls["extend"] == [128]
+    assert eng.prefill_sizes == ([128, 256, 512] if ok else [256, 512]) and sorted(eng._prefills) == eng.prefill_sizes
+
+def test_cublaslt_check_keep_rule_and_switch(monkeypatch):
+  """W15 FZ_CUBLASLT_CHECK: pod A's microbench (2x H200, us at M = 128 / 2048, pinned vs FuseZap's kernel) drops Qwen's
+  gate_up and Llama's qkv plans; a plan faster over both sizes is kept. The engine calls the check only when the switch
+  is on, after the plans exist."""
+  from types import SimpleNamespace as NS
+  from fusezap.device.cuda_kernels import cublaslt
+  from fusezap.serve import engine as E
+  from fusezap.helpers import getenv
+  assert not cublaslt.keep_rule({128: 528.8, 2048: 1443.0}, {128: 129.6, 2048: 1444.9})   # qwen72b-tp2 gate_up
+  assert not cublaslt.keep_rule({128: 101.1, 2048: 217.9}, {128: 29.8, 2048: 253.6})      # llama70b-tp2 qkv
+  assert cublaslt.keep_rule({256: 90.0, 4096: 1000.0}, {256: 95.0, 4096: 1030.0})
+  assert cublaslt.check_speed("NOPE", []) == {}
+  calls = []
+  monkeypatch.setattr(cublaslt, "available", lambda: True)
+  monkeypatch.setattr(cublaslt, "enable", lambda dev, shapes, Ms, log=None, group="prefill": {})
+  monkeypatch.setattr(cublaslt, "check_speed", lambda dev, Ms, log=None, group="prefill": calls.append(list(Ms)) or {})
+  w = NS(shape=(64, 32))
+  eng = NS(model=NS(dtype=E.dtypes.bfloat16, layers=[NS(wqkv=w, wo=w, wgu=w, wd=w, bqkv=None)], device="CUDA"), prefill_sizes=[256, 512], _prefills={})
+  E.enable_cublaslt(eng); assert calls == []
+  monkeypatch.setenv("FZ_CUBLASLT_CHECK", "1"); getenv.cache_clear()
+  try: E.enable_cublaslt(eng); assert calls == [[256, 512]]
+  finally: monkeypatch.delenv("FZ_CUBLASLT_CHECK"); getenv.cache_clear()
 
 def test_prefill_budget():
   from fusezap.serve.engine import prefill_budget, prefill_row_bytes
@@ -300,3 +369,12 @@ def test_prefill_selects_rows_when_prefill_tokens_eq_num_seqs(model, workload, a
   idx = [14, 1, 2, 0]                 # 5, 2, 7, 1 prompt tokens: several prompts finish in one prefill step
   got = eng.generate([prompts[i] for i in idx], [SamplingParams(max_tokens=6, ignore_eos=True) for _ in idx])
   for i, g in zip(idx, got): assert g == alone[i][:6], f"request {i} (prompt {len(prompts[i])} tokens)"
+
+def test_first_logits_row_seq_reads_rows():
+  """W15 pod A3: tests/test_serve_cuda.py's _first_logits read a step's rows as tuples; the engine passes _Rows."""
+  import importlib.util, os
+  from fusezap.serve.engine import _Rows
+  sp = importlib.util.spec_from_file_location("tsc", os.path.join(os.path.dirname(__file__), "test_serve_cuda.py"))
+  m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+  rows = _Rows(np.array([7, 7, 9, -1]), np.array([0, 1, 0, 0]), np.array([5, 6, 8, 0]))
+  assert [m._row_seq(rows, r) for r in (1, 2)] == [7, 9] and m._row_seq([(3, 0, 1)], 0) == 3

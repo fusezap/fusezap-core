@@ -40,7 +40,9 @@ Nothing has been released yet. `scripts/release.py cut X.Y.Z` moves the Unreleas
   under 40 GB). Details: docs/status/i95-flux2-klein-cuda/.
 - **Structured outputs and tools**: grammar-constrained decoding (`response_format` JSON schema / JSON object, strict
   named and required tool calls; optional `llguidance`), and tool calls for Hermes, Mistral and Llama 3.x
-  (`llama3_json`) chat formats.
+  (`llama3_json`) chat formats. Streams are live for Qwen2.5 (Hermes) and Llama 3.x tools: content is sent as it is
+  generated and each tool call once its choice ends. The constraint is applied on the host to each step's logits, so
+  it works on every backend (CUDA, Metal, NEURON, CPU) without changing the compiled forwards.
 - **FuseZap Invarix** (`fusezap invarix`): qualifies a serving release against a float32 reference and a baseline
   release, with accuracy (teacher-forced top-1, greedy exact match), functional, structured (101 tool-call and 50 JSON
   tasks), performance (short / mixed / long-context profiles), stability and reliability checks; stored baselines; a
@@ -48,7 +50,8 @@ Nothing has been released yet. `scripts/release.py cut X.Y.Z` moves the Unreleas
 - **Compiler core**: lazy tensors with a scheduler, symbolic shapes, kernel fusion, a BEAM search over kernel
   options (`FZ_BEAM`), jitted kernel replay (`fz.jit`), custom-kernel hooks, and a C backend for CPUs.
 - `fusezap.__version__`, this changelog, the release policy and tooling (`docs/releases/`, `scripts/release.py`,
-  `scripts/release_matrix.py`), and SECURITY.md.
+  `scripts/release_matrix.py`; `release.py checksums` checks the built artifacts and writes SHA256SUMS), SECURITY.md
+  and SUPPORT.md.
 
 ### Changed
 

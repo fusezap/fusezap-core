@@ -15,9 +15,10 @@ stream_options.include_usage, logprobs (completions: `logprobs` k and `echo`, al
 chat `tools` / `tool_choice` (none, auto, required, a named function; Hermes, Mistral and Llama 3.1+ JSON formats parsed into
 `tool_calls`, fusezap/serve/tools.py), `response_format` json_object / json_schema and strict tools with a named / required
 tool_choice (grammar-constrained decoding, fusezap/serve/constrain.py: needs the optional llguidance package, else 400).
-A streamed request with logprobs, echo or active Hermes / Mistral tools gets its chunks after generation finishes (the output
-must be complete to be scored or parsed); with Llama 3.1+ tools the stream is live until the output starts like a call
-(then that choice is held to its end and sent as tool_calls deltas: id, type and name first, then the arguments).
+A streamed request with logprobs, echo or active Mistral tools gets its chunks after generation finishes (the output
+must be complete to be scored or parsed); with Llama 3.1+ tools the stream is live until the output starts like a call,
+with Hermes tools (Qwen2.5) until `<tool_call>` appears (then that choice is held to its end and sent as tool_calls
+deltas: id, type and name first, then the arguments).
 `parallel_tool_calls: false` keeps at most one tool call per choice. Fields that would change the output and are not
 implemented (presence / frequency penalties, logit_bias, best_of, suffix and the others in UNSUPPORTED) are a 400
 `unsupported_parameter` unless they carry their neutral value (0, null, {}, absent), so a request never gets a silently
@@ -33,15 +34,15 @@ from starlette.routing import Route
 from fusezap.serve.engine import LLMEngine, RequestOutput, SamplingParams
 from fusezap.serve.scheduler import SeqStatus
 from fusezap.serve.tokenizer import IncrementalDecoder, Tokenizer
-from fusezap.serve import logprobs as LP, tools as TL, metrics as MX, serveprof as SP
+from fusezap.serve import logprobs as LP, tools as TL, metrics as MX, serveprof as SP, hostpath as HP
 
 class ReqTrace:
   """FZ_REQ_TRACE=<prefix>: one JSON line per request with wall-clock (time.time) timestamps, for the turnaround between
   closed-loop waves (speed run 4 round 12). The API process writes <prefix>.api.jsonl: recv (handler entered), parsed
   (body parsed and checked), submit (sent to the engine), first (first output event), last (final output event),
   done ([DONE] written to the stream). The engine process writes <prefix>.engine.jsonl: add (the add command received),
-  sched (the step that first scheduled it began after this), fin (its last token emitted), out (that step's outputs
-  sent). Both carry the API's request number (rid) of the engine pipe; off (no file) when FZ_REQ_TRACE is unset."""
+  sched (the step that first scheduled it began after this), first_out (the step that made its first token ended; I69),
+  fin (its last token emitted), out (that step's outputs sent). Both carry the API's request number (rid) of the engine pipe; off (no file) when FZ_REQ_TRACE is unset."""
   def __init__(self, suffix: str):
     import os
     p = os.environ.get("FZ_REQ_TRACE")
@@ -309,6 +310,7 @@ def _engine_main(conn: Any, args: Any) -> None:
       print(f"fusezap: warm-up {time.perf_counter() - t0:.1f}s (first run on a cold ~/.cache/fusezap also tunes kernels: minutes)", flush=True)
     print(f"fusezap: mode {eng.mode}", flush=True)
     _print_memory(eng)
+    if HP.gc_settle(getattr(eng, "tp", None)): print("fusezap: gc frozen after warm-up (FZ_SERVE_GC=freeze)", flush=True)
     conn.send(("ready", {"max_model_len": eng.max_model_len, "vocab": int(eng.model.embed_host.shape[0]), "mode": eng.mode}))
   except BaseException:
     with contextlib.suppress(OSError): conn.send(("dead", traceback.format_exc()))
@@ -378,6 +380,10 @@ def _engine_main(conn: Any, args: Any) -> None:
       if tr.f is not None:
         for rid, d in tt.items():
           if "sched" not in d and "pre" in d and ((s := eng.seqs.get(rid)) is None or s.first_step >= 0): d["sched"] = d.pop("pre")
+        if res:   # I69: when the step that made a request's first token ended (its outputs are sent next)
+          t1 = time.time()
+          for rid, *_ in res:
+            if (d := tt.get(rid)) is not None and "first_out" not in d: d["first_out"] = t1
       ch = st.update()
       if res: conn.send(("out", res, st.snap))
       elif ch: conn.send(("stats", st.snap))
@@ -772,10 +778,10 @@ class Server:
         work.append((p, SamplingParams(**{**sp.__dict__, "seed": None if sp.seed is None else sp.seed + j}) if j else sp, stops))
         src.append(pi)
     stream = bool(body.get("stream"))
-    # logprobs, echo and Hermes / Mistral tool calls need the whole output (to score or parse it): such a stream is sent once it is done
+    # logprobs, echo and Mistral tool calls need the whole output (to score or parse it): such a stream is sent once it is done
     buffered = ex["k"] is not None or ex["echo"] or (spec.active and not TL.streams_live(spec))
     one_call = body.get("parallel_tool_calls") is False   # at most one tool call per choice (strict tools: also in the grammar)
-    live_tools = spec.active and not buffered   # llama3_json: content streams live, a call is held to the end of its choice
+    live_tools = spec.active and not buffered   # llama3_json / hermes: content streams live, a call is held to the end of its choice
     usage_in_stream = bool((body.get("stream_options") or {}).get("include_usage"))
     rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -874,15 +880,20 @@ class Server:
       return StreamingResponse(sse_done(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
     # Peek at the first event so errors (bad request, engine failure) become a proper HTTP error instead of a broken stream.
+    # FZ_SERVE_EARLY_HEADERS=1 (fusezap/serve/hostpath.py): no peek, the response starts now (its status and headers go out
+    # during the prefill instead of after the first token); an engine error before the first token is then the stream's
+    # error event, as one after it is.
     merged = self._merge(gens)
-    try: first = await merged.__anext__()
-    except StopAsyncIteration: first = None
-    except BaseException:
-      await merged.aclose(); raise
+    first = None
+    if not HP.early_headers():
+      try: first = await merged.__anext__()
+      except StopAsyncIteration: first = None
+      except BaseException:
+        await merged.aclose(); raise
     kind: list[str | None] = [None] * len(work)   # live_tools: per choice None (undecided) | "content" | "tool"
     held = [""] * len(work)
     def tool_end(i: int, text: str, fin: str) -> list[dict]:
-      """A held llama3_json choice at its end: tool_calls deltas (per call: id, type, name and empty arguments, then the
+      """A held llama3_json / hermes choice at its end: tool_calls deltas (per call: id, type, name and empty arguments, then the
       arguments) and finish_reason "tool_calls" (a named tool_choice: "stop"); not a call: the text as content."""
       calls, content = TL.parse(spec, spec.forced_prefix + text)
       calls = calls[:1] if one_call else calls
@@ -907,6 +918,17 @@ class Server:
             except StopAsyncIteration: break
           i, (t, f, k, _) = item
           ntoks[i] = k
+          if live_tools and spec.fmt == "hermes":   # content live up to <tool_call>, then held to the choice's end
+            held[i] += t
+            if kind[i] != "tool":
+              t, held[i], call = TL.hermes_split(spec, held[i], final=bool(f))
+              if call: kind[i] = "tool"
+              if t: yield enc(chunk(i, t, None))
+            if kind[i] == "tool":
+              if f:
+                for o in tool_end(i, held[i], f): yield enc(o)
+            elif f: yield enc(chunk(i, "", f))
+            continue
           if live_tools and kind[i] != "content":
             held[i] += t
             if kind[i] is None:

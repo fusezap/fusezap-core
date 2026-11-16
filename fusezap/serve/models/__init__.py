@@ -3,7 +3,8 @@ from __future__ import annotations
 from fusezap.dtype import DType, dtypes
 from fusezap.serve.models.llama import Llama, LlamaConfig, KVCache, ContiguousKVCache  # noqa: F401
 
-ARCHITECTURES: dict[str, type] = {"llama": Llama, "qwen2": Llama, "mistral": Llama, "qwen3": Llama}
+ARCHITECTURES: dict[str, type] = {"llama": Llama, "qwen2": Llama, "mistral": Llama, "qwen3": Llama, "olmoe": Llama,   # olmoe: I105, models/moe.py
+                                 "gemma3_text": Llama, "olmo3": Llama}   # I105 B: models/swa.py
 
 def load_model(name_or_path: str, dtype: DType = dtypes.float32, device: str | None = None, **kw) -> Llama:
   from fusezap.serve.weights import resolve_model, load_config

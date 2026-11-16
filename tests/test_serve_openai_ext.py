@@ -226,11 +226,13 @@ def test_chat_tool_calls(fake):
   assert ch["finish_reason"] == "tool_calls" and ch["message"]["content"] is None
   call = ch["message"]["tool_calls"][0]
   assert call["function"]["name"] == "get_weather" and json.loads(call["function"]["arguments"]) == {"city": "Paris"}
-  # streamed: one tool_calls delta with an index, then finish_reason tool_calls
+  # streamed (live, the call held to the end of the choice): a delta with index, id and name, one with the arguments,
+  # then finish_reason tool_calls
   ev = _sse(httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER], "stream": True}))
   deltas = [e["choices"][0]["delta"] for e in ev]
   tc = [d["tool_calls"] for d in deltas if "tool_calls" in d]
-  assert len(tc) == 1 and tc[0][0]["index"] == 0 and tc[0][0]["function"]["name"] == "get_weather" and ev[-1]["choices"][0]["finish_reason"] == "tool_calls"
+  assert len(tc) == 2 and tc[0][0]["index"] == 0 and tc[0][0]["function"]["name"] == "get_weather" and ev[-1]["choices"][0]["finish_reason"] == "tool_calls"
+  assert json.loads(tc[1][0]["function"]["arguments"]) == {"city": "Paris"} and not any(d.get("content") for d in deltas)
   # tool_choice none: tools are not rendered and nothing is parsed
   r = httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER], "tool_choice": "none"}).json()
   assert "tool_calls" not in r["choices"][0]["message"] and r["choices"][0]["finish_reason"] == "stop"
@@ -257,7 +259,7 @@ def test_parallel_tool_calls_false_keeps_one_call(fake):
   assert names(httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER, CLOCK], "parallel_tool_calls": False})) == ["get_weather"]
   ev = _sse(httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER, CLOCK], "parallel_tool_calls": False, "stream": True}))
   tc = [d["tool_calls"] for e in ev if "tool_calls" in (d := e["choices"][0]["delta"])]
-  assert len(tc) == 1 and len(tc[0]) == 1 and tc[0][0]["function"]["name"] == "get_weather"
+  assert len(tc) == 2 and all(len(x) == 1 and x[0]["index"] == 0 for x in tc) and tc[0][0]["function"]["name"] == "get_weather"
   rr = httpx.post(url + "/v1/chat/completions", json={"messages": msgs, "tools": [WEATHER], "parallel_tool_calls": "no"})
   assert rr.status_code == 400 and rr.json()["error"]["param"] == "parallel_tool_calls"
 

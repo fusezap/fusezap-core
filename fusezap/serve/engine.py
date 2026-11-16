@@ -11,8 +11,8 @@ A step runs at most two jitted forwards over the shared paged cache (`Llama.forw
   - decode: max_num_seqs rows, one token per running sequence past its prompt (padding rows are inert);
   - prefill: up to max_prefill_tokens rows of prompt chunks from up to max_num_seqs sequences, returning the logits of
     the chunks that end a prompt. It runs at the smallest of `prefill_sizes` that holds the step's prompt rows (CUDA:
-    max_prefill_tokens, default prefill_budget(): 2048 if the free memory holds it, and its halves down to 256;
-    elsewhere max_prefill_tokens alone, default 256).
+    max_prefill_tokens, default prefill_budget(): 2048 if the free memory holds it, and its halves down to 128 (256
+    with FZ_PREFILL_MIN=256); elsewhere max_prefill_tokens alone, default 256).
 Each forward has a fixed shape, so each is captured once and then replayed (no tracing, scheduling or lowering per
 step), and their kernels never change with the batch composition (the prefill sizes share one split-K attention
 partition count, the largest size's, since that count sets the order of a token's key sums). Every kernel computes a row independently of the other rows,
@@ -34,7 +34,7 @@ from fusezap.serve.kv_cache import PagedKVCache, StepLayout, lib_linear
 from fusezap.serve.sampling import Sampler
 from fusezap.serve.scheduler import Scheduler, SchedulerConfig, Sequence, SeqStatus, SchedulerOutput
 from fusezap.serve.weights import to_dtype
-from fusezap.serve.models.llama import rope_tables
+from fusezap.serve.models.llama import rope_host
 
 @dataclass
 class SamplingParams:
@@ -120,6 +120,10 @@ class _Forward:
     c.layout = self.layout
     if ctx is not None: c.ctx = ctx
     wide = lib_linear if not self.prefill and self.eng.lib_gemm else None
+    if x.dtype == dtypes.int32:   # I69 FZ_NEURON_EMBED_DEV: element offsets of the token rows in the device table
+      from fusezap.serve.neuron_kv import embed_gather
+      x = embed_gather(x, self.eng.model)
+    if x.dtype != self.eng.model.dtype: x = x.cast(self.eng.model.dtype)   # I69: bf16 token rows (neuron_kv.embed_bf16), widened exactly
     lg = self.eng.model.forward_tokens(x, c, cos, sin, select=self.prefill or self.R != self.N, wide_linear=wide).float()
     if not self.eng.device_argmax: return lg
     if self.eng.neuron:
@@ -169,7 +173,13 @@ class _Forward:
     elif e.upload:
       from fusezap.serve.neuron_kv import upload
       if (sv >= 0).any(): ids = np.where(sv >= 0, [prev.host_id(int(j)) if j >= 0 else 0 for j in sv], ids)
-      x, cos, sin = (upload(a, m.device, m.dtype) for a in (m.embed(ids[None])[0], e._cos[pos], e._sin[pos]))
+      if self.prefill and e.embed_dev:   # I69 FZ_NEURON_EMBED_DEV: N int32 offsets; the rows are gathered on the device
+        from fusezap.codegen.nki_prefill import embed_offsets
+        x = upload(embed_offsets(ids, m.embed_host.shape[1]), m.device, dtypes.int32)
+      elif self.prefill and e.embed_bf16:   # I69: the table's bf16 rows (half the bytes, queued with the launch), widened in the forward
+        x = upload(to_dtype(m.embed_host[np.asarray(ids, np.int64)], dtypes.bfloat16), m.device, dtypes.bfloat16)
+      else: x = upload(m.embed(ids[None])[0], m.device, m.dtype)
+      cos, sin = (upload(a, m.device, m.dtype) for a in (e._cos[pos], e._sin[pos]))
       mt = upload(meta, m.device, dtypes.int32)
     else:
       if (sv >= 0).any(): ids = np.where(sv >= 0, [prev.host_id(int(j)) if j >= 0 else 0 for j in sv], ids)
@@ -236,17 +246,29 @@ class _Logits:
     if self._host is None: self._host = self.lg.numpy()
     return int(sp(self._host[i], s.tokens))
 
-def prefill_sizes(device: str, max_prefill_tokens: int) -> list[int]:
-  """Row counts of the prefill forwards, ascending. CUDA: max_prefill_tokens and its halves down to 256, so a big budget
-  admits many prompts per step (every mixed step also pays a whole decode forward) while a short prompt still runs a
-  small forward; a token's result does not depend on the row count (row-wise kernels, M-independent GEMM sums).
-  Elsewhere one size, as before."""
+PREFILL_MIN_FLOOR = 128   # FZ_PREFILL_MIN's floor: a prefill GEMM must stay above FZ_GEMM_SMALL_M (64; those rows take the
+                          # decode swap-AB kernel, another K order), so 128 is the smallest prefill size with prefill bits
+
+def prefill_min() -> int:
+  """The smallest CUDA prefill size (FZ_PREFILL_MIN, default 128 since W15; 256 restores the sizes before it): a short
+  prompt (Invarix "short": 128 tokens) no longer pads to 256 rows. With per-size cuBLASLt algos (FZ_CUBLASLT_PER_M,
+  default on) 2x H200 TTFT c1 went 44.8 -> 27.7 ms (Llama-3.3-70B) and 65.9 -> 28.3 ms (Qwen2.5-72B), H100 7B 12.6 ms,
+  tokens unchanged (docs/status/W15-GPU-BENCH.md). Clamped to [PREFILL_MIN_FLOOR, 256]."""
+  return max(PREFILL_MIN_FLOOR, min(256, getenv("FZ_PREFILL_MIN", 128)))
+
+def prefill_sizes(device: str, max_prefill_tokens: int, min_rows: int | None = None) -> list[int]:
+  """Row counts of the prefill forwards, ascending. CUDA: max_prefill_tokens and its halves down to min_rows (default
+  prefill_min(): 128, or 256 with FZ_PREFILL_MIN=256), so a big budget admits many prompts per step (every mixed step
+  also pays a whole decode forward) while a short prompt still runs a small forward; a token's result does not depend
+  on the row count (row-wise kernels, M-independent GEMM sums; LLMEngine drops the sizes below 256 if a pinned cuBLASLt
+  plan cannot cover them unchanged). Elsewhere one size, as before."""
   sizes, n = [max_prefill_tokens], max_prefill_tokens
   if device.split(":")[0].upper() in ("NEURON", "NKISHIM", "NKISIM"):   # I77: FZ_NEURON_PREFILL_SIZES (e.g. 128,512) below max_prefill_tokens
     from fusezap.serve.neuron_prefill import prefill_sizes as _nps
     return sorted({s for s in (_nps(max_prefill_tokens, device) or []) if s < max_prefill_tokens} | {max_prefill_tokens})
   if device.split(":")[0] == "CUDA":
-    while n % 2 == 0 and n // 2 >= 256: n //= 2; sizes.append(n)
+    lo = prefill_min() if min_rows is None else max(PREFILL_MIN_FLOOR, min_rows)
+    while n % 2 == 0 and n // 2 >= lo: n //= 2; sizes.append(n)
   return sorted(sizes)
 
 def decode_buckets(device: str, max_num_seqs: int) -> list[int]:
@@ -296,7 +318,16 @@ def enable_cublaslt(eng: "LLMEngine") -> dict:
     if nm in want and getattr(w, "apply", None) is None and len(getattr(w, "shape", ())) == 2: shapes.append((int(w.shape[0]), int(w.shape[1]), kind, out))
   if not shapes: return {}
   log = lambda msg: print(msg, flush=True)
-  plans = cublaslt.enable(m.device, shapes, list(eng.prefill_sizes), log=log)
+  # W15: sizes below 256 (FZ_PREFILL_MIN=128) never change the pinned algos: the plans are built over the sizes >= 256
+  # exactly as before, then extended to the small ones only if each plan, unchanged, passes the bit self-check there
+  # too; otherwise the engine drops the small sizes (a prompt's bits must not depend on its bucket)
+  base = [n for n in eng.prefill_sizes if n >= 256] or list(eng.prefill_sizes)
+  small = [n for n in eng.prefill_sizes if n not in base]
+  plans = cublaslt.enable(m.device, shapes, base, log=log)
+  if small and not cublaslt.extend(m.device, small, log=log): eng.drop_prefill_sizes(small, "a pinned cuBLASLt plan does not cover them unchanged")
+  # W15 FZ_CUBLASLT_CHECK=1 (default off): drop the plans slower than FuseZap's own kernel over the smallest and largest
+  # prefill sizes (70B TP ranks on H200: the M = 2048 algos are 1.6-4x slower at 128 / 256 rows)
+  if getenv("FZ_CUBLASLT_CHECK", 0): cublaslt.check_speed(m.device, list(eng.prefill_sizes), log=log)
   # decode rows (FZ_CUBLASLT_DECODE, opt-in, default off; e.g. "o,gate_up"): a second pinned algo per shape, self-checked
   # over the decode buckets (1 .. max_num_seqs), so a decode row's bits do not depend on the bucket or the batch. Not with
   # exact-mode mixed forwards, whose decode rows must carry the swap-AB kernel's bits (cuda.linear redo_rows).
@@ -357,15 +388,14 @@ class LLMEngine:
     from fusezap.serve.neuron_kv import NeuronKVCache, is_neuron
     self.neuron = is_neuron(model.device)   # N5: the pool's device side without indirect DMA (fusezap/serve/neuron_kv.py)
     self.cache = cache or (NeuronKVCache if self.neuron else PagedKVCache).for_model(model, num_blocks, block_size, self.max_model_len)
-    cos, sin = rope_tables(model.cfg, self.max_model_len)
-    if self.neuron:   # the step's RoPE rows as NeuronKVCache multiplies them (no table kernels per step)
-      from fusezap.serve.neuron_kv import rope_rows
-      cos, sin = rope_rows(cos, sin)
+    # NEURON: the step's RoPE rows as NeuronKVCache multiplies them (no table kernels per step); I105 B: (global | local)
+    cos, sin = rope_host(model.cfg, self.max_model_len, self.neuron)
     self._cos, self._sin = to_dtype(cos, model.dtype), to_dtype(sin, model.dtype)
     # lookahead (FZ_LOOKAHEAD, default on for CUDA): a decode-only step of greedy rows enqueues the next decode, fed by its
     # device argmaxes, before it reads its own tokens, so the host work of a step overlaps the GPU; CUDA builds decode
     # inputs on the device (DeviceSteps: embedding + RoPE tables there, about 1.1 GB for a 152k x 3584 bf16 table)
     self.lookahead, self.dsteps = bool(getenv("FZ_LOOKAHEAD", 1 if cuda else 0)), None
+    if model.cfg.rope_local_theta is not None or model.cfg.embed_scale: self.lookahead = False   # I105 B: DeviceSteps has one RoPE table, unscaled rows
     if cuda and self.lookahead:
       from fusezap.device import Device
       from fusezap.serve.cuda import DeviceSteps
@@ -388,6 +418,12 @@ class LLMEngine:
     self.device_argmax = cuda or (self.neuron and os.environ.get("FZ_NEURON_DEVICE_ARGMAX", "1") not in ("", "0"))
     from fusezap.device.neuron import host_fast
     self.upload = self.neuron and host_fast()   # N7: step inputs written straight into device buffers (no schedule per input)
+    from fusezap.serve.neuron_kv import embed_bf16, embed_check, embed_dev
+    self.embed_bf16 = self.upload and embed_bf16(model)   # I69: prefill token rows uploaded as bf16 (FZ_NEURON_EMBED_BF16)
+    self.embed_dev = self.upload and embed_dev(model)     # I69 follow-up: prefill token rows gathered on the device (FZ_NEURON_EMBED_DEV)
+    if self.embed_dev and (why := embed_check(model)):
+      print(f"fusezap: FZ_NEURON_EMBED_DEV off: the device gather failed its check ({why}); token rows are uploaded", file=sys.stderr, flush=True)
+      self.embed_dev = False
     # CUDA: the linears are library GEMMs and BEAM search is compile-bound (NVRTC per candidate, ~30+ min cold for 0.5B),
     # so the composed rest keeps the hand-coded opts unless a beam is asked for
     self.decode_beam = decode_beam if decode_beam is not None else (model.beam or (0 if cuda else 4))
@@ -659,6 +695,13 @@ class LLMEngine:
     elif len(s.output) >= p.max_tokens or s.num_tokens >= self.max_model_len: self.scheduler.finish(s, "length")
     return self._out(s, [tok])
 
+  def drop_prefill_sizes(self, sizes: Iterable[int], why: str) -> None:
+    """Remove prefill sizes (never the largest) before any forward is keyed or captured (LLMEngine.__init__ only)."""
+    drop = {n for n in sizes if n != self.prefill_sizes[-1]}
+    if not drop: return
+    print(f"fusezap: prefill sizes {sorted(drop)} dropped: {why}", flush=True)
+    self.prefill_sizes = [n for n in self.prefill_sizes if n not in drop]
+    for n in drop: self._prefills.pop(n, None)
   def _decode_fwd(self, n: int) -> _Forward: return self._decodes[next(b for b in self.decode_sizes if b >= n)]
 
   # ---- lookahead: the next decode is enqueued before the previous one's tokens are read

@@ -6,6 +6,8 @@ scripts/accuracy_top1_h100.sh
 scripts/aws_remote.sh
 scripts/diag_top1_layers.py
 scripts/engine_repro_job.sh
+scripts/gemma3_mac_check.py
+scripts/gemma3_nkishim.py
 scripts/h100_7b_check.sh
 scripts/invarix_70b_vllm.sh
 scripts/invarix_7b_h100.sh
@@ -19,8 +21,14 @@ scripts/land_public_pr.sh
 scripts/licence_dev.py
 scripts/licence_test_kit.sh
 scripts/nki_7b_inf2.sh
+scripts/nki_aws_newest_inf2.sh
+scripts/nki_aws_newest_trn1.sh
 scripts/nki_bf16_compare.py
 scripts/nki_bf16_trn1.sh
+scripts/nki_gemma3_inf2.sh
+scripts/nki_i91_pod.sh
+scripts/nki_klein_i93_inf2.sh
+scripts/nki_klein_i93b_inf2.sh
 scripts/nki_klein_inf2.sh
 scripts/nki_klein_neff_pod.sh
 scripts/nki_llama8b_inf2.sh
@@ -46,6 +54,9 @@ scripts/nki_n8_ar_inf2.sh
 scripts/nki_n8_bf16_trn1.sh
 scripts/nki_n8_prefill_choose.py
 scripts/nki_n8_prefill_inf2.sh
+scripts/nki_olmoe_inf2.sh
+scripts/nki_olmoe_sparse_inf2.sh
+scripts/nki_w15_trn1_c4.sh
 scripts/public_export.py
 scripts/remote.sh
 scripts/speed_ab_h100.sh
@@ -67,3 +78,7 @@ scripts/tp_m2_70b.sh
 scripts/tp_m3_70b.sh
 scripts/tp_m5_ar.sh
 scripts/tracker.sh
+scripts/w15_confirm_h100.sh
+scripts/w15_h100.sh
+scripts/w15_launch.sh
+scripts/w15_ttft_h200.sh

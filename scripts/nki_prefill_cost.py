@@ -3,6 +3,10 @@ fusezap/codegen/nki_prefill.py), by scripts/nki_layer_cost.py's list-schedule mo
 traces, at Qwen2.5-7B's TP=2 shard shapes (D 3584, I 9472 per rank, 14 / 2 heads, head_dim 128, bf16 weights).
 
   uv run python scripts/nki_prefill_cost.py [--rows 128,512] [--ctx 128,256,512] [--json out.json]
+  uv run python scripts/nki_prefill_cost.py --rows 128 --ctx 128 --paths v2exact,v2exact+hb,v2exact+silu,v2exact+xf,v2exact+i69,v2   # I69
+
+A path is v1 | v2exact | v2 (act), the v2 ones with optional "+" flags (I69): hb (FZ_NEURON_PFK_ATTN_HB=2048), silu
+(FZ_NEURON_PFK_SILU=2048), xf (FZ_NEURON_PFK_EXPF=1), i69 (all three); without flags a v2 path is main's kernels.
 
 What it does: a random 3-layer model of the shard's shapes runs one prefill of `rows` tokens at a pool of `ctx` slots on
 NKISHIM (numpy; FZ_NEURON_FUSE=1: one fused kernel per layer, the head apart), once per path; the middle layer's fused
@@ -28,15 +32,18 @@ HEAD = dict(V=152064, K=3584, R=4)
 
 def log(*a) -> None: print(*a, flush=True)
 
-def layer_item(mode: str, rows: int, ctx: int, shard: dict, exp: str = "exact"):
+from fusezap.codegen.nki_prefill import I69_FLAGS, i69_env   # I69: a path's "+" flags (no flags: main's kernels)
+
+def layer_item(mode: str, rows: int, ctx: int, shard: dict, exp: str = "exact", flags: set = frozenset()):
   """(fused program of the middle layer, its argument sizes, member names) of a prefill at rows x ctx on NKISHIM."""
   from fusezap.device import nkishim as S
   import nki_layer_cost as C
   from nki_n7_layer_bench import qwen_shaped
   from fusezap.serve import neuron_prefill as PF
-  saved = {k: os.environ.get(k) for k in ("FZ_NEURON_FUSE", "FZ_NEURON_FUSE_MAX", "FZ_NEURON_HEAD_FUSE", "FZ_NEURON_DTYPE", "FZ_NEURON_PLAN", "FZ_NEURON_PFK_EXP", "FZ_NEURON_BF16_HEAD")}
+  saved = {k: os.environ.get(k) for k in ("FZ_NEURON_FUSE", "FZ_NEURON_FUSE_MAX", "FZ_NEURON_HEAD_FUSE", "FZ_NEURON_DTYPE", "FZ_NEURON_PLAN", "FZ_NEURON_PFK_EXP", "FZ_NEURON_BF16_HEAD",
+                                           *(v[0] for v in I69_FLAGS.values()))}
   os.environ.update({"FZ_NEURON_FUSE": "1", "FZ_NEURON_FUSE_MAX": "0", "FZ_NEURON_HEAD_FUSE": "0", "FZ_NEURON_DTYPE": "bf16", "FZ_NEURON_PLAN": "0", "FZ_NEURON_BF16_HEAD": "0",
-                     "FZ_NEURON_PFK_EXP": exp})
+                     "FZ_NEURON_PFK_EXP": exp, **i69_env(set(flags))})
   PF.set_mode(None, mode)
   real = S.nisa.__dict__.copy()
   for nm in C.ISA: setattr(S.nisa, nm, getattr(S.isa, nm))   # the model runs for real
@@ -111,8 +118,9 @@ def main() -> None:
     for ctx in [int(x) for x in a.ctx.split(",")]:
       if ctx < rows: continue
       for path in a.paths.split(","):
-        mode, exp = ("v1", "exact") if path == "v1" else ("v2", "exact" if path.endswith("exact") else "act")
-        prog, sizes, members = layer_item(mode, rows, ctx, SHARD, exp)
+        base, *fl = path.split("+")
+        mode, exp = ("v1", "exact") if base == "v1" else ("v2", "exact" if base.endswith("exact") else "act")
+        prog, sizes, members = layer_item(mode, rows, ctx, SHARD, exp, set(fl))
         res = analyse(prog, sizes, members, P)
         pk = onchip_peak(prog, sizes)
         res["sbuf_peak_kib"], res["psum_peak_kib"] = round(pk["sbuf"] / 1024, 1), round(pk["psum"] / 1024, 1)

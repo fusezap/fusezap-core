@@ -7,7 +7,8 @@ timeline of one layer that holds no collective, so it runs alone).
   FZ_DEVICE=NKISHIM uv run python scripts/nki_pfk_bench.py --hidden 256 --inter 384 --configs v1:64:128,v2:64:128   # Mac dry run
 
 A random 3-layer bf16 model of the shard's shapes (D 3584, I 9472, 14 / 2 heads, head_dim 128, vocab 512), FZ_NEURON_FUSE=1
-(one fused kernel per layer, the head apart): per config <path>:<rows>:<pool slots> (path v1 | v2 (ScalarE exp) | v2exact (the default exp)) a prefill of
+(one fused kernel per layer, the head apart): per config <path>:<rows>:<pool slots> (path v1 | v2 (ScalarE exp) | v2exact (the default exp);
+I69: a v2 path's "+" flags hb / silu / xf / i69 turn on nki_prefill's wide exact-exp forms, none = main's kernels) a prefill of
 `rows` tokens, captured, then --replays replays with the allocator's profile on: per fused kernel the runtime's execute
 ms and nrtpy's device-time benchmark (device_ms); the middle layer's kernel (layer 1) is the per-layer number. Logits of
 every config vs the v1 config of the same rows and slots (bitwise expected for v2exact; v2 within tolerance). Before a v2
@@ -50,6 +51,7 @@ def main() -> None:
   from fusezap.device.neuron import FusedCall, neff_cache_dir, neuron_profile
   from fusezap.serve import neuron_kv as kv, neuron_prefill as PF
   from nki_n7_layer_bench import qwen_shaped
+  from fusezap.codegen.nki_prefill import i69_env
   dev = Device.DEFAULT
   assert kv.is_neuron(dev), f"FZ_DEVICE must be a NEURON tier, got {dev}"
   D = Device[dev]
@@ -67,10 +69,12 @@ def main() -> None:
     if a.budget_s and time.perf_counter() - t_all > a.budget_s: log(f"pfk_bench: budget reached, {cfg} and the rest not run"); break
     path, rows, ctx = cfg.split(":")
     rows, ctx = int(rows), int(ctx)
-    mode, exp = ("v1", "exact") if path == "v1" else ("v2", "exact" if path.endswith("exact") else "act")
+    base, *flags = path.split("+")
+    mode, exp = ("v1", "exact") if base == "v1" else ("v2", "exact" if base.endswith("exact") else "act")
     rec: dict = {"config": cfg, "path": path, "rows": rows, "ctx": ctx}
     try:
       os.environ["FZ_NEURON_PFK_EXP"] = exp
+      os.environ.update(i69_env(flags))   # I69: "+hb", "+silu", "+xf", "+i69"; none: main's kernels
       PF.set_mode(None, mode)
       if ctx not in models: models[ctx] = qwen_shaped(dev, 1, ctx, layers=3, hidden=a.hidden, inter=a.inter, heads=a.heads, kv=a.kv, hd=a.hd)
       m = models[ctx]

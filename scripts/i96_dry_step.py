@@ -2,6 +2,7 @@
 
   PYTHONPATH=. python scripts/i96_dry_step.py --size 1024 --json out.json                  # Mac: launches, NEFF list, HBM
   PYTHONPATH=. python scripts/i96_dry_step.py --size 1024 --compile --target inf2 --jobs 8  # Linux + .venv-nki --cc: NEFFs
+  PYTHONPATH=. python scripts/i96_dry_step.py --size 512 --batch 4 --json out.json        # I93: a batch-4 step (images API n=4)
 
 The step is exactly what ImageEngine / Flux2KleinPipeline.denoise runs per denoising step on NEURON (eager, realize per
 block, the W1 routing: bf16 K-major weights through neuron_kv.matmul_bf16, float32 flash attention). The weights are
@@ -59,7 +60,7 @@ def transformer(dt):
   tr._tfreq = empty((128,))
   return tr
 
-def dry_step(size: int, dt) -> tuple[list, dict]:
+def dry_step(size: int, dt, batch: int = 1) -> tuple[list, dict]:
   """Run one eager step with Device[DEV].run recording instead of executing. Returns (items, memory stats)."""
   dev = Device[DEV]
   al = dev.allocator
@@ -81,7 +82,7 @@ def dry_step(size: int, dt) -> tuple[list, dict]:
     tr._tfreq.lazydata.realized.ensure_allocated()
     weights = al.held - al.cached
     cos, sin = empty((T + g * g, tr.cfg.head_dim)), empty((T + g * g, tr.cfg.head_dim))
-    x, e, t = empty((1, g * g, 128)), empty((1, T, 7680)), empty((1,))
+    x, e, t = empty((batch, g * g, 128)), empty((batch, T, 7680)), empty((batch,))   # I93: batch rows = ImageEngine's bucket
     t0 = time.perf_counter()
     v = tr.forward(x, e, t, cos, sin)
     v = v.float()._realized_contiguous()
@@ -156,21 +157,22 @@ def main() -> None:
   ap = argparse.ArgumentParser()
   ap.add_argument("--size", type=int, default=1024)
   ap.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+  ap.add_argument("--batch", type=int, default=1, help="I93: images per step (ImageEngine's batch bucket; serve-image --max-batch)")
   ap.add_argument("--compile", action="store_true", help="compile every distinct kernel to a NEFF (needs .venv-nki with neuronx-cc)")
   ap.add_argument("--target", default=os.environ.get("FZ_NEURON_TARGET", "inf2"))
   ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 4))
   ap.add_argument("--json", default=None)
   a = ap.parse_args()
   def log(*m) -> None: print(*m, flush=True)
-  items, mem = dry_step(a.size, getattr(dtypes, a.dtype))
+  items, mem = dry_step(a.size, getattr(dtypes, a.dtype), a.batch)
   def save() -> None:
     if a.json:
       with open(a.json, "w") as f:
-        json.dump({"size": a.size, "dtype": a.dtype, "launches": len(kern), "distinct": len(recs), "memory": mem, "target": a.target if a.compile else None,
+        json.dump({"size": a.size, "dtype": a.dtype, "batch": a.batch, "launches": len(kern), "distinct": len(recs), "memory": mem, "target": a.target if a.compile else None,
                    "kernels": [{k: v for k, v in r.items() if k != "prog"} for r in recs]}, f, indent=1)
   recs = programs(items)
   kern = [it for it in items if it is not None]
-  log(f"klein step {a.size}^2 {a.dtype}: {len(kern)} launches, {len(recs)} distinct NEFFs, {len(items) - len(kern)} copies "
+  log(f"klein step {a.size}^2 {a.dtype} batch {a.batch}: {len(kern)} launches, {len(recs)} distinct NEFFs, {len(items) - len(kern)} copies "
       f"(recorded in {mem['record_s']} s)")
   log(f"device memory (W3): weights {mem['weights_bytes'] / GiB:.2f} GiB, peak in use {mem['peak_in_use_bytes'] / GiB:.2f} GiB "
       f"(step transient {mem['step_transient_peak_bytes'] / GiB:.2f} GiB), peak held incl. free list {mem['peak_held_bytes'] / GiB:.2f} GiB; "

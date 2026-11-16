@@ -128,7 +128,7 @@ def msl_rows(name: str, T: str) -> str:
   O[i] = src < 0 ? ({T})0 : X[src * D + i % D];
 }}"""
 
-ATTN_PARAMS = ("N", "Hkv", "bs", "NB", "MB", "xs", "mrow", "mpos", "mbt", "scale_bits")
+ATTN_PARAMS = ("N", "Hkv", "bs", "NB", "MB", "xs", "mrow", "mpos", "mbt", "scale_bits", "win")   # win (I105): sliding window, 0 = none
 def msl_paged_attn(name: str, T: str, hd: int, G: int) -> str:
   """Paged attention for N query tokens: token t (block-table row M[mrow+t], position M[mpos+t]; row < 0 = padding, output
   0) attends to keys 0..pos of its sequence. One threadgroup per (token, kv head) with G simdgroups, one per query head
@@ -141,7 +141,7 @@ def msl_paged_attn(name: str, T: str, hd: int, G: int) -> str:
   device {T}* o = O + (t * Hkv * {G} + h) * {hd};
   const int row = M[mrow + t];
   if (row < 0) {{ for (int d = lane; d < {hd}; d += 32) o[d] = ({T})0; return; }}
-  const int pos = M[mpos + t];
+  const int pos = M[mpos + t], lo = win > 0 ? max(0, pos - win + 1) : 0;   // keys lo..pos (I105: a sliding window)
   device const int* bt = M + mbt + row * MB;
   const float scale = as_type<float>(scale_bits), log2e = 1.4426950408889634f;
   float q[{hd}];
@@ -151,7 +151,7 @@ def msl_paged_attn(name: str, T: str, hd: int, G: int) -> str:
   for (int c = 0; c < {DC}; c++) acc[c] = 0.0f;
   float m = -INFINITY, den = 0.0f;
   const int vo = NB * Hkv * bs * {hd};
-  for (int j0 = 0; j0 <= pos; j0 += 32) {{
+  for (int j0 = lo; j0 <= pos; j0 += 32) {{
     const int j = j0 + (int)lane;
     float s = -INFINITY;
     int base = 0;
@@ -265,7 +265,7 @@ def _np_paged_attn(a: list[np.ndarray], p: dict, hd: int, G: int) -> None:
       O3[t] = 0
       continue
     pos, bt = int(M[p["mpos"] + t]), M[p["mbt"] + row * MB:]
-    js = np.arange(pos + 1)
+    js = np.arange(max(0, pos - p["win"] + 1) if p["win"] > 0 else 0, pos + 1)
     blk = bt[js // bs].astype(np.int64)
     K, V = P5[0, blk, :, js % bs], P5[1, blk, :, js % bs]          # (S, Hkv, hd)
     q = X[t * p["xs"]:t * p["xs"] + Hq * hd].reshape(Hkv, G, hd).astype(np.float32)
@@ -329,14 +329,15 @@ def kv_write(pool: Buffer, x: Buffer, meta: Buffer, n: int, H: int, hd: int, bs:
 
 def paged_attention(x: Buffer, pool: Buffer, meta: Buffer, N: int, Hkv: int, G: int, hd: int, bs: int, NB: int, MB: int,
                     xs: int, mrow: int, mpos: int, mbt: int, scale: float, prefill: bool = False, np_n: int = 0, mix: int = 0,
-                    mix_exact: bool = True) -> Buffer:
-  if x.device.split(":")[0].upper() == "CUDA":   # P3-ATTN's paged kernels read this layout and metadata directly
+                    mix_exact: bool = True, win: int = 0) -> Buffer:
+  if x.device.split(":")[0].upper() == "CUDA":
+    if win: raise NotImplementedError("sliding-window paged attention is not in the CUDA kernels (I105)")   # P3-ATTN's paged kernels read this layout and metadata directly
     from fusezap.device.cuda_kernels import attention as cuda_attn
     return cuda_attn.paged_attention(x, pool, meta, N, Hkv, G, hd, bs, NB, MB, xs, mrow, mpos, mbt, scale, prefill, np_n, mix, mix_exact)
   # mix (LLMEngine mixed forwards; off CUDA only under FZ_MIX_ANY for tests): this kernel treats prompt and decode rows alike
   out = Buffer(x.device, N * Hkv * G * hd, x.dtype)
   nm = f"fz_paged_attn_{hd}_{G}"
-  pr = (N, Hkv, bs, NB, MB, xs, mrow, mpos, mbt, _f32_bits(scale))
+  pr = (N, Hkv, bs, NB, MB, xs, mrow, mpos, mbt, _f32_bits(scale), int(win))
   run_call(ServeCall(nm, lambda T: msl_paged_attn(nm, T, hd, G), ATTN_PARAMS, pr, (N * Hkv, 1, 1), (32 * G, 1, 1),
                      lambda a, p: _np_paged_attn(a, p, hd, G)), (out, x, pool, meta))
   return out
@@ -421,12 +422,15 @@ class PagedKVCache(KVCache):
       self.allocator, self.tables, self._rows = _shared.allocator, _shared.tables, _shared._rows
       self.pools, self._inputs = list(_state or _shared.pools), list(_inputs if _inputs is not None else _shared._inputs)
     self.layout: StepLayout | None = _shared.layout if _shared is not None else None
+    self.windows: tuple[int, ...] = _shared.windows if _shared is not None else ()   # I105: per layer sliding window (0 = full)
 
   @staticmethod
   def for_model(model: Any, num_blocks: int, block_size: int = 16, max_seq_len: int | None = None) -> "PagedKVCache":
     c = model.cfg
-    return PagedKVCache(c.n_layers, c.n_kv_heads, c.head_dim, num_blocks, block_size, model.dtype, model.device,
-                        max_seq_len or model.max_len)
+    pc = PagedKVCache(c.n_layers, c.n_kv_heads, c.head_dim, num_blocks, block_size, model.dtype, model.device,
+                      max_seq_len or model.max_len)
+    pc.windows = tuple(getattr(c, "layer_windows", None) or ())
+    return pc
 
   # ---- bookkeeping (host)
   @property
@@ -522,7 +526,8 @@ class PagedKVCache(KVCache):
     N, rs = qkv.shape[0], (n_heads + 2 * H) * hd
     xb, meta, pool = _buf(qkv), _buf(self._inputs[0]), _buf(self.pools[layer])
     if not written: kv_write(pool, xb, meta, N, H, hd, self.bs, self.num_blocks, rs, n_heads * hd, (n_heads + H) * hd, L.slot)
-    o = paged_attention(xb, pool, meta, N, H, n_heads // H, hd, self.bs, self.num_blocks, L.MB, rs, L.row, L.pos, L.bt, scale, L.prefill, L.np_n, L.mix, L.mix_exact)
+    o = paged_attention(xb, pool, meta, N, H, n_heads // H, hd, self.bs, self.num_blocks, L.MB, rs, L.row, L.pos, L.bt, scale, L.prefill, L.np_n, L.mix, L.mix_exact,
+                        win=self.windows[layer] if self.windows else 0)
     return _wrap(o, (N, n_heads * hd))
   def select(self, x: Tensor) -> Tensor:
     """The step's logits rows of x (N, D) -> (R, D)."""

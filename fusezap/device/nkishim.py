@@ -82,13 +82,14 @@ def from_f32(x: np.ndarray, dt: DType) -> np.ndarray:
 class NkiTensor:
   """A view (shape, strides, offset in elements) of a flat storage array on a memory region."""
   def __init__(self, storage: np.ndarray, dtype: DType, buffer: str, shape: tuple[int, ...], strides: tuple[int, ...] | None = None,
-               offset: int = 0, name: str = ""):
+               offset: int = 0, name: str = "", gather: tuple[int, np.ndarray] | None = None):
     if strides is None:
       acc, st = 1, []
       for s in reversed(shape): st.append(acc); acc *= s
       strides = tuple(reversed(st))
     self.storage, self.dtype, self.buffer, self.name = storage, dtype, buffer, name
     self.shape, self.strides, self.offset = tuple(int(s) for s in shape), tuple(int(s) for s in strides), int(offset)
+    self.gather = gather   # I105 A2 indirect DMA: (dim, int64 element offsets) replacing arange(shape[dim]) * stride (ap vector_offset)
   def __repr__(self): return f"<NkiTensor {self.name or '?'} {self.buffer} {self.shape} {self.dtype}>"
   @property
   def ndim(self) -> int: return len(self.shape)
@@ -99,7 +100,8 @@ class NkiTensor:
   def _index(self) -> np.ndarray:
     idx = np.full(self.shape, self.offset, np.int64)
     for k, (s, st) in enumerate(zip(self.shape, self.strides)):
-      idx = idx + (np.arange(s, dtype=np.int64) * st).reshape([-1 if j == k else 1 for j in range(self.ndim)])
+      term = self.gather[1] if self.gather is not None and self.gather[0] == k else np.arange(s, dtype=np.int64) * st
+      idx = idx + term.reshape([-1 if j == k else 1 for j in range(self.ndim)])
     if idx.size and (idx.min() < 0 or idx.max() >= self.storage.size):
       raise IndexError(f"NKISHIM: out-of-bounds access on {self!r}: index range [{idx.min()}, {idx.max()}] "
                        f"outside storage of {self.storage.size} elements (pattern {self.get_pattern()}, offset {self.offset})")
@@ -116,6 +118,7 @@ class NkiTensor:
     self.storage[self._index()] = r.reshape(self.shape).astype(self.storage.dtype, copy=False)
 
   def __getitem__(self, key) -> "NkiTensor":
+    assert self.gather is None, "NKISHIM: slicing an indirect access pattern is not modelled"
     key = key if isinstance(key, tuple) else (key,)
     if any(k is Ellipsis for k in key):
       i = key.index(Ellipsis)
@@ -136,15 +139,41 @@ class NkiTensor:
       shape.append(len(range(start, stop, step))); strides.append(st * step); off += start * st
     return NkiTensor(self.storage, self.dtype, self.buffer, tuple(shape), tuple(strides), off, self.name)
 
-  def ap(self, pattern: list[list[int]], offset: int | None = None, dtype: DType | None = None, **kw) -> "NkiTensor":
+  def ap(self, pattern: list[list[int]], offset: int | None = None, dtype: DType | None = None, scalar_offset: Any = None,
+         vector_offset: Any = None, indirect_dim: int = 0, **kw) -> "NkiTensor":
+    """An access pattern over this tensor. I105 A2 (sparse MoE decode, nki_moe.py), runtime addresses from on-chip values
+    (**the semantics are this shim's model of nki 0.6's ap() options, unverified on hardware**; FZ_NKISHIM_IDMA picks the
+    model of vector_offset so each hypothesis the chip self-test tries has its own shim):
+      scalar_offset: a (1, 1) int32 SBUF value added to the offset (elements);
+      vector_offset: a (pattern[indirect_dim] count, 1) int32 SBUF tile; FZ_NKISHIM_IDMA=replace (default): index i along
+        indirect_dim is vector_offset[i] (times that dim's step) instead of i; =add: vector_offset[i] elements are added to
+        the affine address of index i (the step term stays)."""
     assert not kw, f"NKISHIM: ap() options {sorted(kw)} are not modelled"
     assert dtype is None or dtype == self.dtype, "NKISHIM: ap(dtype=) reinterpretation is not modelled"
     assert all(int(n) >= 1 for _, n in pattern), f"NKISHIM: ap() counts must be >= 1: {pattern}"
     if self.buffer in ON_CHIP and len(pattern) > 1 and len(self.shape) > 1:
       free = int(np.prod(self.shape[1:]))
       assert pattern[0][0] == free, f"NKISHIM: on-chip ap() partition step {pattern[0][0]} must equal the free size {free}"
-    return NkiTensor(self.storage, self.dtype, self.buffer, tuple(n for _, n in pattern), tuple(s for s, _ in pattern),
-                     self.offset + (offset or 0), self.name)
+    off = self.offset + (offset or 0)
+    shape, strides = tuple(int(n) for _, n in pattern), tuple(int(s) for s, _ in pattern)
+    gather = None
+    if scalar_offset is not None or vector_offset is not None:
+      assert self.buffer not in ON_CHIP, "NKISHIM: runtime offsets are modelled for HBM access patterns only"
+    if scalar_offset is not None:
+      assert isinstance(scalar_offset, NkiTensor) and scalar_offset.buffer == SBUF and scalar_offset.size == 1 and \
+        scalar_offset.dtype.name == "int32", f"NKISHIM: scalar_offset must be a (1, 1) int32 SBUF value, got {scalar_offset!r}"
+      off += int(scalar_offset.values().reshape(-1)[0])
+    if vector_offset is not None:
+      d = int(indirect_dim)
+      assert 0 <= d < len(shape), f"NKISHIM: indirect_dim {d} outside the pattern {pattern}"
+      vo = vector_offset
+      assert isinstance(vo, NkiTensor) and vo.buffer == SBUF and vo.dtype.name == "int32" and vo.shape[0] == shape[d] and vo.size == shape[d], \
+        f"NKISHIM: vector_offset must be a ({shape[d]}, 1) int32 SBUF tile, got {vo!r}"
+      v = vo.values().reshape(-1).astype(np.int64)
+      mode = os.environ.get("FZ_NKISHIM_IDMA", "replace")
+      assert mode in ("replace", "add"), f"NKISHIM: FZ_NKISHIM_IDMA={mode!r}"
+      gather = (d, np.arange(shape[d], dtype=np.int64) * strides[d] + v if mode == "add" else v * strides[d])   # element offsets along d
+    return NkiTensor(self.storage, self.dtype, self.buffer, shape, strides, off, self.name, gather)
 
   def view(self, dtype: DType) -> "NkiTensor":
     assert dtype.itemsize == self.dtype.itemsize, "NKISHIM: only same-size view(dtype) is modelled"
@@ -366,6 +395,10 @@ class _ISA:
     return int(offset) + np.arange(dst.shape[0], dtype=np.int64)[:, None] * int(channel_multiplier) + v[None, :]
   def iota(self, dst: NkiTensor, pattern, offset=0, channel_multiplier=0, name=None) -> None:
     _onchip(dst)
+    # neuronx-cc 2.27 (inf2, I105 A2 chip run 2): "ISA requirement: Data Pattern Step (8388608) cannot exceed int16 range"
+    # (NCC_INLA001, birverifier::checkIota); the channel multiplier is held to the same range here (not verified separately)
+    for st in [int(st) for st, _ in pattern] + [int(channel_multiplier)]:
+      assert -2 ** 15 <= st < 2 ** 15, f"NKISHIM: iota step / channel_multiplier {st} outside int16 (neuronx-cc rejects it)"
     v = self._affine(dst, pattern, offset, channel_multiplier)
     dst.write_raw(from_f32(v.astype(np.float32), dst.dtype) if dst.dtype.is_float else v.astype(dst.dtype.storage))
   def affine_select(self, dst: NkiTensor, pattern, channel_multiplier, on_true_tile: NkiTensor, on_false_value, cmp_op: _Op = None,

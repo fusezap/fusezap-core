@@ -961,7 +961,7 @@ def test_prefill_job_confirm_mode_runs_the_defaults():
   assert not re.search(r"FZ_NEURON_(TP_PREFILL|PREFILL_CTX|TP_PREFILL_FUSE)", conf), conf
   assert "unset FZ_NEURON_PREWARM FZ_NEURON_PREWARM_JOBS" in src
   calls = re.findall(r"tp_phase \S+ \d+ fz7b_http (\S+) (\S+)", src)
-  assert len(calls) == 3, calls
+  assert len(calls) == 7, calls   # I69 (--i69, --i69-served): served chosen + main each
   for call in calls:
     assert call[1] in ("auto", "none", "text"), call
   body = src.split("fz7b_http() {", 1)[1].split("\n}\n", 1)[0]
@@ -994,3 +994,35 @@ def test_ttft_probe_flags_a_first_request_that_compiles(tmp_path):
     r = run()
     assert r.returncode == 1 and "[20]" in r.stdout and "NOT PREWARMED" in r.stdout, r.stdout + r.stderr
   finally: srv.shutdown()
+
+def test_tp2_embed_dev_tokens_equal_tp1(tmp_path, monkeypatch):
+  """I69 follow-up, FZ_NEURON_EMBED_DEV=1 on both ranks (the env before the launch, as `fusezap serve --tp 2` passes it):
+  a float32 server over a bf16 checkpoint (Qwen2.5-7B's head layout) gathers each prefill's token rows on every rank's
+  device; LLMEngine's greedy tokens equal TP=1's with the bf16 upload (I69's default)."""
+  torch = pytest.importorskip("torch")
+  stt = pytest.importorskip("safetensors.torch")
+  from test_tp import tiny_model_dir
+  from fusezap.serve.engine import LLMEngine, SamplingParams
+  import shutil
+  p = tiny_model_dir(str(tmp_path / "f"), seed=3, cfg={"hidden_size": 256, "intermediate_size": 384, "num_attention_heads": 28,
+                                                        "num_key_value_heads": 4, "head_dim": 128})
+  b = tmp_path / "b"; b.mkdir()
+  for f in os.listdir(p):
+    if not f.endswith(".safetensors"): shutil.copy(os.path.join(p, f), b / f)
+  stt.save_file({k: v.to(torch.bfloat16) for k, v in stt.load_file(os.path.join(p, "model.safetensors")).items()}, str(b / "model.safetensors"))
+  monkeypatch.setenv("FZ_NEURON_EMBED_DEV", "1")
+  g = dist.launch(2, TIER, timeout=120)
+  try:
+    ref, m = _pair(g, str(b))
+    kw = dict(num_blocks=32, block_size=16, max_num_seqs=4, max_prefill_tokens=64, decode_beam=0)
+    monkeypatch.setenv("FZ_NEURON_EMBED_DEV", "0")
+    e1 = LLMEngine(ref, **kw)
+    monkeypatch.setenv("FZ_NEURON_EMBED_DEV", "1")
+    e2 = LLMEngine(m, **kw)
+    assert e1.embed_bf16 and not e1.embed_dev and e2.embed_dev
+    g.post("engine", e2.tp_spec(), e2.tp_signature())
+    g.barrier("engine")
+    ps = [[int(t) for t in np.random.default_rng(9 + i).integers(0, 199, n)] for i, n in enumerate((7, 30, 18))]
+    sp = SamplingParams(max_tokens=10, ignore_eos=True)
+    assert e2.generate(ps, sp) == e1.generate(ps, sp)
+  finally: g.close()

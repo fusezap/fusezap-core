@@ -17,6 +17,11 @@ import numpy as np
 
 H, I, QKV = 3584, 18944, 4608
 SHAPES = [("qkv", QKV, H), ("o", H, H), ("gate_up", 2 * I, H), ("down", H, I)]
+# W15: a tensor-parallel rank's prefill linears (2x H200 TTFT): --shapes llama70b-tp2 / qwen72b-tp2, --M 128,256,512,2048
+PRESETS = {"qwen7b": SHAPES,
+           "llama70b-tp2": [("qkv", 5120, 8192), ("o", 8192, 4096), ("gate_up", 28672, 8192), ("down", 8192, 14336)],
+           "qwen72b-tp2": [("qkv", 5120, 8192), ("o", 8192, 4096), ("gate_up", 29568, 8192), ("down", 8192, 14784)]}
+PIN = "min"   # --pin: which M's top heuristic algo is pinned (the engine pins the largest prefill size's: max)
 L2 = 128 << 20
 
 def part_ours(Ms: list[int]) -> list[dict]:
@@ -137,9 +142,9 @@ def part_cublas(Ms: list[int]) -> list[dict]:
     ncp = max(2, -(-L2 // (N * K * 2)))
     ws = [(torch.randn(N, K, device="cuda", generator=g) * 0.02).to(torch.bfloat16) for _ in range(ncp)]
     X = torch.randn(Mx, K, device="cuda", generator=g).to(torch.bfloat16)
-    h0 = lt.heuristic(min(Ms), N, K)
+    h0 = lt.heuristic(min(Ms) if PIN == "min" else max(Ms), N, K)
     pinned = None
-    if h0:   # the smallest M's top algo, split-K forced off, reused at every M
+    if h0:   # the smallest (--pin max: largest) M's top algo, split-K forced off, reused at every M
       pinned = (ctypes.c_uint64 * 8).from_buffer_copy(h0[0].algo)
       lt.set_cfg(pinned, CFG_SPLITK, 1)
     rows = {}
@@ -179,7 +184,11 @@ def main() -> None:
   ap.add_argument("--part", choices=["ours", "cublas"], required=True)
   ap.add_argument("--M", default="2048,4096,8192")
   ap.add_argument("--json", default=None)
+  ap.add_argument("--shapes", default="qwen7b", choices=sorted(PRESETS))
+  ap.add_argument("--pin", default="min", choices=["min", "max"])
   a = ap.parse_args()
+  global SHAPES, PIN
+  SHAPES, PIN = PRESETS[a.shapes], a.pin
   Ms = sorted(int(m) for m in a.M.split(","))
   res = part_ours(Ms) if a.part == "ours" else part_cublas(Ms)
   if a.json:

@@ -183,16 +183,23 @@ def _label(it: Any, cfg: Any) -> tuple[str, int]:
   n = name.lower()
   return next((c for c, p in _CLASS if re.search(p, n)), "elementwise" if re.match(r"^[er]_", n) else f"other:{name[:40]}"), 0
 
-def kernel_breakdown(g: Any, n: int, eng: Any = None, reps: int = 3) -> dict:
-  """Every rank: GPU ms per item class of the captured decode forward of n rows (launch by launch, CUDA events per item;
-  the inputs of its last replay, so it writes the same KV-cache slots with the same values). Engine idle; CUDA only."""
+def prefill_breakdown(g: Any, n: int) -> dict:
+  """kernel_breakdown of the captured prefill forward of n rows (W15: where a short prompt's TTFT goes)."""
+  return kernel_breakdown(g, n, prefill=True)
+
+def kernel_breakdown(g: Any, n: int, eng: Any = None, reps: int = 3, prefill: bool = False) -> dict:
+  """Every rank: GPU ms per item class of the captured decode forward of n rows (prefill: the n-row prefill forward)
+  (launch by launch, CUDA events per item; the inputs of its last replay, so it writes the same KV-cache slots with the
+  same values). Engine idle; CUDA only."""
   from fusezap.ir import ScheduleItem
   from fusezap import jit as J
   from fusezap.shape.symbolic import sym_infer, Node
   eng = eng if eng is not None else _engine(g)
-  f = eng._decode_fwd(n)
+  if prefill and n not in eng._prefills: return {"rank": g.rank, "n": n, "prefill": True, "error": f"no {n}-row prefill forward ({sorted(eng._prefills)})"}
+  f = eng._prefills[n] if prefill else eng._decode_fwd(n)
   c = f.jit.captured
-  if c is None or c.gstage is None: return {"rank": g.rank, "error": f"decode forward {n} not captured as a graph yet"}
+  if c is None or getattr(c, "gstage", None) is None or getattr(getattr(c, "gdev", None), "cu", None) is None:
+    return {"rank": g.rank, "n": n, "prefill": prefill, "error": f"{'prefill' if prefill else 'decode'} forward {n} not captured as a graph yet"}
   dev = c.gdev
   cu = dev.cu
   pools = iter([t._realized_contiguous().realized for t in eng.cache.state()])   # the written inputs: the KV pools
@@ -227,10 +234,12 @@ def kernel_breakdown(g: Any, n: int, eng: Any = None, reps: int = 3) -> dict:
       ms = float(cu.cuEventElapsedTime(a, b)[1])
       tot[lab] += ms / (reps - 1); gb[lab] += nb / 1e9 / (reps - 1); cnt[lab] += 1
       cu.cuEventDestroy(a); cu.cuEventDestroy(b)
-  out = {"rank": g.rank, "n": n, "items": sum(cnt.values()) // max(1, reps - 1), "total_ms": round(sum(tot.values()), 3),
+  out = {"rank": g.rank, "n": n, "prefill": prefill, "items": sum(cnt.values()) // max(1, reps - 1), "total_ms": round(sum(tot.values()), 3),
          "classes": {k: round(v, 4) for k, v in sorted(tot.items(), key=lambda kv: -kv[1])},
          "gemm_TBps": {k: round(gb[k] / (tot[k] / 1e3) / 1e3, 3) for k in tot if k.startswith("gemm:") and tot[k] > 0},
          "count": {k: v // max(1, reps - 1) for k, v in cnt.items()}}
+  if prefill:   # weight bytes x rows = the GEMM's flops (2 N K M with 2-byte weights)
+    out["gemm_TFLOPs"] = {k: round(gb[k] * 1e9 * n / (tot[k] / 1e3) / 1e12, 1) for k in tot if k.startswith("gemm:") and tot[k] > 0}
   return out
 
 def graph_ms(g: Any, n: int, reps: int = 20, eng: Any = None) -> dict:

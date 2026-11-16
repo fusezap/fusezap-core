@@ -27,7 +27,12 @@ def serve_image(a: Any) -> int:
   t0 = time.perf_counter()
   pipe = load_pipeline(a.pipeline, a.device or Device.DEFAULT, a.dtype)
   bs = [int(x) for x in a.batch_sizes.split(",")] if a.batch_sizes else None
-  eng = ImageEngine(pipe, max_batch=a.max_batch, batch_sizes=bs)
+  mb = a.max_batch
+  if (cap := getattr(pipe, "max_batch_cap", None)) is not None and mb > cap:   # I93: klein on NEURON serves one image per step
+    print(f"fusezap: --max-batch {mb} -> {cap} on {getattr(pipe, 'device', '?')} (each batch size is its own set of kernels)", flush=True)
+    mb = cap
+    bs = [b for b in bs if b <= cap] or None if bs else None
+  eng = ImageEngine(pipe, max_batch=mb, batch_sizes=bs)
   print(f"fusezap: loaded image pipeline {eng.name} on {eng.device} in {time.perf_counter() - t0:.1f}s", flush=True)
   if not a.no_warmup:
     t0 = time.perf_counter()

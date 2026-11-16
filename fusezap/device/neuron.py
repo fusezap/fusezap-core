@@ -29,7 +29,7 @@ hook, so those graphs reach TensorE as one kind="custom" item instead of compose
 with fusezap.codegen.nki_kernels (params baked in, cached by kernel name + params) and runs it on the tier's runtime.
 Direct entry points: `attention(q, k, v, causal=, coff=, pos=)` (flash attention with GQA; causal by `affine_select`,
 the decode mask from an int32 position tensor) and `kmajor(w)` (a weight relaid K-major once at load time, so the matmul
-kernel's moving tiles are contiguous rows).
+kernel's moving tiles are contiguous rows; float32 on the host, I105 B2).
 A kernel the renderer cannot lower raises `NKIUnsupported`; nothing falls back to another device.
 """
 from __future__ import annotations
@@ -37,7 +37,7 @@ import atexit, hashlib, itertools, json, math, os, pickle, shutil, struct, subpr
 from pathlib import Path
 from typing import Any
 import numpy as np
-from fusezap.codegen.nki import NKIProgram, NKIRenderer, NKIUnsupported
+from fusezap.codegen.nki import NKIProgram, NKIRenderer, NKIUnsupported, dma_budget
 from fusezap.device import Compiler, DeviceBase, LRUAllocator, Program
 from fusezap.device.npy import NPYAllocator
 from fusezap.dtype import to_np
@@ -504,6 +504,14 @@ class NeuronNeffProgram(Program):
   def __call__(self, *args: Any, wait: bool = False, **kw: Any) -> float | None:
     raise RuntimeError("NeuronNeffProgram runs on device buffers: NEURONDevice.run_program")
 
+class SplitProgram(Program):
+  """I105 B2: a renderer kernel over the DMA descriptor budget (nki.dma_budget) as several launches of the same buffers
+  (NKIRenderer.render_split: each part covers a range of one independent loop, so the outputs are the whole kernel's bits).
+  run_program launches the parts in order; fusion and fz.jit's NEFF replay leave it alone (run() every time)."""
+  def __init__(self, prog: NKIProgram, parts: list[Program]):
+    super().__init__(prog.name, b"")
+    self.prog, self.parts = prog, parts
+
 class NeffReplay:
   """N7 (host_fast): one captured item's launch at fz.jit replay without NEURONDevice.run's per-launch work (the program
   looked up by its spec, every argument's size and dtype, the binding dict over ~60 arguments of a fused layer): the exec
@@ -709,6 +717,10 @@ class NEURONDevice(DeviceBase):
       "attention": CustomKernel("fz_attention", {t: "nki_kernels.render_attention"}, ATTENTION.signature, 4),
       "attention_mask": CustomKernel("fz_attention_mask", {t: "nki_kernels.render_attention"},
                                      ATTENTION.signature[:4] + ("M",) + ATTENTION.signature[4:] + ATTN_MASK_PARAMS, 5)}
+    from fusezap.codegen.nki_conv import conv_enabled
+    if conv_enabled():   # I91 (I81 D9): the implicit-GEMM conv (nki_conv.render_conv), FZ_NEURON_CONV=1 (default off)
+      from fusezap.schedule import CONV_PARAMS
+      self.custom_kernels["conv"] = CustomKernel("fz_conv", {t: "nki_conv.render_conv"}, ("C", "A", "X") + CONV_PARAMS, 3)
 
   def _backend(self) -> tuple[Compiler, Any]:
     if not neuron_device_present():
@@ -750,8 +762,17 @@ class NEURONDevice(DeviceBase):
     from fusezap.codegen.lower import _ast_key
     key = (_ast_key(si.ast), vv, self.renderer.pmax, self.renderer.fmax)
     if (prg := self._cache.get(key)) is None:
-      prog = self.renderer.render(si.ast, si.var_vals)
-      self._cache[key] = prg = self.runtime(prog, self.compiler.compile(prog.src))
+      prog, parts = self.renderer.render_split(si.ast, si.var_vals)
+      if parts:   # I105 B2: over the DMA descriptor budget: several launches (nki.dma_budget)
+        print(f"NEURON: {prog.name}: ~{prog.dma_desc:,} DMA descriptors (estimate) > {dma_budget():,}: {len(parts)} launches "
+              f"(~{max(p.dma_desc for p in parts):,} each at most)", file=sys.stderr, flush=True)
+        prg = SplitProgram(prog, [self.runtime(p, self.compiler.compile(p.src)) for p in parts])
+      else:
+        if prog.dma_desc > (b := dma_budget()) > 0:
+          print(f"NEURON: {prog.name}: ~{prog.dma_desc:,} DMA descriptors (estimate) > {b:,} and no split applies: it may not load "
+                f"(TDRV descriptor limit)", file=sys.stderr, flush=True)
+        prg = self.runtime(prog, self.compiler.compile(prog.src))
+      self._cache[key] = prg
     if len(fast) > 4096: fast.clear()
     fast[id(si.ast)] = (si.ast, vv, prg)   # holds the AST, so its id is not reused while the entry lives
     return prg
@@ -787,6 +808,9 @@ class NEURONDevice(DeviceBase):
     if (prg := self._cache.get(key)) is None:
       if name == "fz_matmul": prog = nk.render_matmul(params)
       elif name in ("fz_attention", "fz_attention_mask"): prog = nk.render_attention(nk.spec_from_params(params, name == "fz_attention_mask"))
+      elif name == "fz_conv":
+        from fusezap.codegen.nki_conv import render_conv
+        prog = render_conv(params)
       else: raise NKIUnsupported(f"{self.tier}: no NKI kernel for custom item {name!r}")
       self._cache[key] = prg = self.runtime(prog, self.compiler.compile(prog.src))
     return prg
@@ -807,6 +831,7 @@ class NEURONDevice(DeviceBase):
     return prg
 
   def run_program(self, prg: Program, bufs: tuple) -> float:
+    if isinstance(prg, SplitProgram): return sum(self.run_program(p, bufs) for p in prg.parts)
     if isinstance(prg, NeuronNeffProgram):
       st = time.perf_counter()
       self.run_neff(prg, bufs)
@@ -834,6 +859,7 @@ class NEURONDevice(DeviceBase):
         elif (nm := getattr(getattr(call, "kernel", None), "name", None)) is not None and hasattr(call, "params"): prg = self.custom_program(nm, call.params)
         else: return None
     except NKIUnsupported: return None
+    if isinstance(prg, SplitProgram): return None   # over the DMA descriptor budget: never fused into a bigger launch
     prog = getattr(prg, "prog", None)
     if prog is None or len(si.bufs) < prog.n_bufs: return None
     bufs = tuple(si.bufs[:prog.n_bufs])
@@ -1048,7 +1074,16 @@ class NKISIMDevice(NEURONDevice):
 
 def kmajor(w: Any) -> Any:
   """A torch-layout weight (N, K) relaid K-major once at load time: the realized (K, N) transpose. `x @ kmajor(w)` equals
-  x.linear(w) without bias, and the matmul kernel's moving tiles B[k0:k0+128, n0:n0+512] are then contiguous rows."""
+  x.linear(w) without bias, and the matmul kernel's moving tiles B[k0:k0+128, n0:n0+512] are then contiguous rows.
+  I105 B2: a float32 weight is relaid on the host (read back, numpy transpose, written again: the same bits). On the
+  device the transpose is a renderer kernel whose loads read one element per DMA descriptor: Gemma 3's 262144 x 1152
+  lm_head was 302 M descriptors in one NEFF (the inf2 load failed: `TDRV: Descriptor limit reached`), and the runtime keeps
+  every loaded NEFF's descriptor rings in HBM (~64 B each as inferred in I105 A run 1: ~19 GB for that one, an estimate). FZ_NEURON_KMAJOR_HOST=0
+  keeps the device transpose (split by nki.dma_budget when it is over the descriptor budget)."""
+  from fusezap.dtype import dtypes
+  if w.dtype == dtypes.float32 and os.environ.get("FZ_NEURON_KMAJOR_HOST", "1") not in ("0", ""):
+    from fusezap.tensor import Tensor
+    return Tensor(np.ascontiguousarray(np.swapaxes(w.numpy(), -1, -2)), device=w.device, dtype=w.dtype).realize()
   return w.transpose(-1, -2).contiguous().realize()
 
 def attention(q: Any, k: Any, v: Any, causal: bool = False, scale: float | None = None, coff: int = 0, pos: Any = None) -> Any:

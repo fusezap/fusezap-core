@@ -16,7 +16,7 @@ Files here:
 | `matrix/vX.Y.Z.yaml` | the matrix frozen at each release by `cut` |
 | `matrix/README.md` | the matrix schema |
 
-Elsewhere: `CHANGELOG.md` (Keep a Changelog), `SECURITY.md`, `scripts/release.py`, `scripts/release_matrix.py`, and the
+Elsewhere: `CHANGELOG.md` (Keep a Changelog), `SECURITY.md`, `SUPPORT.md` (where to get help), `scripts/release.py`, `scripts/release_matrix.py`, and the
 "Release note: … / none" line in `.github/pull_request_template.md`. Published copies: GitHub Releases (which give an
 Atom feed) and fusezap.ai/releases with RSS.
 
@@ -118,12 +118,28 @@ ended.
 ## How to cut a release
 
 1. On `main`: fill `CHANGELOG.md`'s Unreleased section, update `matrix/sources.yaml`, run
-   `scripts/release.py draft X.Y.0`, fill every section of the note, and commit.
+   `scripts/release.py draft X.Y.0`, fill every section of the note ("None." where there is nothing: an empty
+   section fails `check`), and commit. Leave `{date}` and `{line_date}` in the note: `cut` fills them with the
+   build date, so a note drafted days ahead does not carry a stale date.
 2. `scripts/release.py cut X.Y.0 --dry-run`, then `scripts/release.py cut X.Y.0`. It refuses on a dirty tree. It
    sets the version, moves Unreleased into `## [X.Y.0] - <date>`, freezes the matrix, adds the index entry, commits
    "Release X.Y.0", creates `release/X.Y` (first cut on a line, including an rc1), makes the annotated tag `vX.Y.0`
    locally, checks it, and moves `main` to `X.(Y+1).0.dev0`.
 3. It prints the push commands. **Pushing stays manual and approved**: nothing is pushed by the tool.
-4. Patches: commit the fixes on `release/X.Y` (cherry-picked from `main`), draft and fill `vX.Y.Z.md`, then
-   `cut X.Y.Z` on that branch. Bring the CHANGELOG section and index entry back to `main`.
+   Build the wheel and sdist from the tagged tree (the run's logs (not published): from the public sync of the tag), then
+   `scripts/release.py checksums X.Y.Z dist/`: it refuses artifacts of another version or holding FuseZap Invarix or
+   key material, and writes `dist/SHA256SUMS`, which goes on the GitHub release with the artifacts (the note's
+   Checksums section says so; the note is tagged before the artifacts exist, so it cannot hold the sums itself).
+4. Patches: commit the fixes on `release/X.Y` (cherry-picked from `main`, `git cherry-pick -x` so the note can cite
+   the original commit), add each under a `## [Unreleased]` section of the branch's CHANGELOG (`### Fixed`), draft
+   and fill `vX.Y.Z.md` (Breaking changes: None.; Fixes: what was wrong, who was affected, which versions), then
+   `cut X.Y.Z` on that branch. It keeps the line date and the line's Invarix version, so Invarix entitlement is
+   unchanged. Bring the CHANGELOG section, the note and the index entry back to `main`.
 5. CI (when it exists) runs `scripts/release.py check vX.Y.Z` on the tag.
+
+## Getting support
+
+`SUPPORT.md` says where to ask (GitHub issues for FuseZap Core, hello@fusezap.ai for anything else,
+security@fusezap.ai for vulnerabilities), what to include in a report, and which versions get fixes (the support
+window above). A bug confirmed on a supported line is fixed on `main` and, when it qualifies (the list above), in a
+patch on each supported line it affects.

@@ -66,6 +66,10 @@ Status (2026-10-21): N0 to N3 done (2026-10-26: N4 and N5 on hardware, N6 on the
 
 **NKISHIM** (`tests/test_neuron_bf16_n8.py`, 46 tests): the wide / prefetching layer is bit-identical to the bf16 members for every LAYER_CASES case (Qwen 1 row / 512, 4 rows / 768 of 1024, odd shapes, two key blocks, one kv head) at WN 1024 / 2048 / 4096, with PF and PFQO (FZ_NKISHIM_MM=f64 as the other early-layer tests), and to LayerBF16 in the default shim too; HeadBF16 = MatmulBF16 bit for bit (1 / 4 / 130 rows, K tails, W 512-4096); through the model, prefill and decode logits equal the default bf16 path's bit for bit (FUSE=1 / 24, head fused, defaults) and the engine's tokens equal CPU float32's. **Cost model** (`scripts/nki_layer_cost.py`, refitted on 50 trn1 measurements incl. the 7 bf16 layers, a per-run DMA cost added: rms log error 0.080; the bf16 layers at 0.89-0.97x of trn1; the run length is not identified by these measurements, so the model credits wider DMAs only with fewer DMAs per queue and less tile rotation). **Predictions (model and arithmetic, not measurements), per layer at 1 row / 512 slots (model / 0.92 = its bias on the bf16 layers):** v2se+bf16 0.207 model (trn1 v2s+bf16 0.2395), w1024 0.194, w2048 0.180, w2048p1q 0.179, w2048p2 and w4096 0.167, at 256 slots each ~0.0125 less; head: the model puts MatmulBF16 and HeadBF16 both at ~1.16 ms (pure bandwidth at its fitted 241 GB/s), trn1 measured MatmulBF16 at 1.52 ms (1 KiB runs: 0.77x of the model), HeadSpec float32 streams 545 MB at 264 GB/s, so HeadBF16 ~1.0-1.15 ms. Per token c1 in process: the bf16 default with FUSE=24 + head fuse ~8.7 ms (I68's 9.49 at FUSE=4 minus step 4's 0.76 ms launch saving); + HeadBF16 ~8.2; + w2048p2 ~6.8; + CTX_MIN=256 ~6.5 (NxDI 5.11: the rest is FuseZap's ~1.4 ms of host + worker + runtime per token at one launch); c4 ~7.0-7.3 ms per step (~550 tok/s vs NxDI 448). **Compile risks:** the wide layer keeps 2-8 PSUM banks accumulating at once (WN 4096: all 8 of trn1's; a PSUM allocation failure is a compile error the bench records as SKIPPED); the prefetched tiles are live across attention (clamped to the SBUF estimate; v2swep's 96 KiB at the top of a float32 layer is the pattern that failed); HeadBF16 at W 4096 is 56 KiB per partition per block (bf16), no double buffering at 2 blocks.
 
+**W15: the float32 trn1 c4 row (2026-11-15, Mac; hardware job `nki_w15_trn1_c4.sh` pending).** The public Status row "Trainium1, output tokens/s with 4 users (Qwen2.5-0.5B, fp32)" cites N7 serve (27 Oct, 198.6 tok/s) against AWS vLLM 0.16 + vllm-neuron 0.5.3 TP=1 **float32** with on-device greedy (N6b trn1, 238.4 tok/s, c1 TPOT 16.30 ms). N7 step 4 (28 Oct, the trn1 step 4 run) already served 303.8 tok/s c4 and 11.01 ms c1 TPOT in float32 (Invarix PROMOTE), and that configuration is the float32 default since N8 base; the row was never re-pointed. Same dtype, same workload (Invarix short, 128 in / 128 out, c1 and c4, 2 repeats, served over HTTP), but AWS's number came from another instance a day earlier, so the job re-measures both on one trn1. New switch, default off: `FZ_NEURON_F32_WN=1024|2048|4096` (`fusezap/codegen/nki_f32w.py`, LayerF32W): the float32 LayerSpec's four weight matmuls on wide moving tiles, N8's `wide_weights` transform applied to the float32 layer (its block pattern matches), so every PSUM chain is the same instructions on the same values: bitwise by construction, and on NKISHIM (`tests/test_neuron_f32w.py`: vs the members at Qwen and odd shapes, vs LayerSpec in the default shim, model logits fused and not, engine tokens). Cost model (`scripts/nki_layer_cost.py`, `v2se+w<cols>`; a model, not a measurement): 1 row / 512 slots 0.316 -> 0.283 ms at w2048, 4 rows / 1024 slots 0.388 -> 0.375 ms; the float32 head got slower with wider blocks on trn1 (step 2b), so this may not gain either; the job decides by device time and bits. The job also serves `FZ_NEURON_CTX=512,640,768,896,1024,2048` (finer pool prefixes for c4; not bitwise vs 1024, accepted only on Invarix accuracy).
+
+**I91 (I81 D9): the implicit-GEMM conv on NEURON tiers (2026-11-15, Mac; pod job `nki_i91_pod.sh` pending).** `FZ_NEURON_CONV=1` (default off) offers the scheduler's "conv" match to NEURON tiers: the run's logs (not published), per <= 128 output channels the Wᵀ tile of every tap and <= 128-channel block (kept in SBUF while <= 64 KiB per partition), per <= 512-pixel tile (whole output rows, or 512-column segments) one PSUM bank accumulating tap by tap, the moving tile being X's shifted window DMAed as one 3-D access pattern on both sides over the tap's valid rows and columns (memset 0 first when the window is partial); `FZ_NEURON_CONV_ROWDMA=1` uses one 2-D DMA per output row instead, in case the on-chip 3-D pattern does not compile. Tap-major summation: float32 rounding vs the composed im2col + matmul, as METAL's conv. Loops unroll at trace time, so the 1024² VAE convs are large programs (~74 k matmuls for 512 -> 512 at 512 x 512, an estimate from the tiling); `scripts/i91_kernels.py` lists and compiles the VAE's 23 distinct convs (512² and 1024²) and both long attentions at each size (VAE mid block S = 16384, D = Dv = 512; klein S = 4608, D = 128).
+
 **[unverified]** marks claims not confirmed against the docs this session. Sources are cited as [n].
 
 ## 1. Facts the design depends on
@@ -138,6 +142,13 @@ NKI has no runtime integer arguments, so every `Var` becomes part of the compile
 7. **Dtypes.** There's no int64, bool is uint8, and fp32 matmul runs at ¼ of the bf16 rate. If IDIV/MOD has no engine op, the conformance report shows it failing.
 8. **Serve's Metal kernels** (paged KV write, row gather, decode attention in `kv_cache.py`) have NEURON versions without indirect DMA (N5, `fusezap/serve/neuron_kv.py`): a one-hot TensorE scatter for the write, a one-hot matmul for the row gather, and a "keyrange" mask over every pool slot for attention. Their cost grows with the pool size (`--num-blocks`).
 9. **Launch granularity.** One schedule item becomes one NEFF execution (~170 µs each on inf2, N4 run 2). N5: launches are batched into one runtime-worker request per jit replay, and the serving path uses three hand-written NKI kernels (KV write, RMSNorm + residual, attention) where the composed graph took several items; SPEC §8 still has no slot for fusing scheduler items into one kernel. N6: the NEURON device rewrites a captured fz.jit forward itself (`fuse_schedule`, called by `jit._device_fuse` for a capture whose items all run on one device that offers it): items between two model-recorded fences become one fused NKI kernel, one launch per decoder layer. The model change is the fence (`neuron_kv.fence`, NEURON only); the fused kernel is the members' rendered kernels concatenated, so no new lowering.
+
+11. **Runtime addresses from a device tensor (I105 A2, `FZ_MOE_SPARSE`, on by default since 15 Nov; `FZ_MOE_SPARSE=0` = dense).** The sparse MoE decode
+   kernels (`codegen/nki_moe.py`) read only the chosen experts' weight tiles: the tile DMAs take their row offsets from
+   int32 values computed in the kernel from the routing (nki 0.6 `ap(vector_offset=, indirect_dim=0)` or
+   `ap(scalar_offset=)`; the form is picked on the chip by `scripts/olmoe_sparse_selftest.py`, **semantics unverified on
+   hardware**). The first gather in the backend; loop bounds stay static (every row reads exactly top_k experts), and every
+   other kernel keeps exceptions 2 and 8. NKISHIM models the indirect access (`FZ_NKISHIM_IDMA`). Details: the run's logs (not published) A2.
 
 ## 5. Vendor kernels through the custom-kernel hook
 `NEURONDevice.custom_kernels = {"matmul": CustomKernel("fz_matmul", …), "attention": CustomKernel("fz_attention", …), "attention_mask": CustomKernel("fz_attention_mask", …)}`, keyed by the tier name (NEURON / NKISHIM / NKISIM). **Done in N3.**
@@ -591,6 +602,56 @@ the 28 layers' member kernels, 81.6 ms device at the 128-slot prefix (I75), agai
   largest, 512, is max_prefill_tokens unless given; FZ_NEURON_PREFILL_SIZES=128 for one size; NKISHIM / NKISIM: one
   size unless set). Not yet served on the chip with the per-prompt rule.
 
+**First token, bitwise (I69).** I78 served main's exact prefill at short c1 TTFT p50 55.1 ms
+(AWS NxDI TP=2 50.6, offline). Where the time goes, from the I78 run's own files (the run's logs (not published) in commit
+39776df): in process the 128-row forward at the 128-slot prefix (Invarix short c1's: lowest-first blocks) is 51.3 ms wall to
+the token; served, recv -> first token is 51.8-54.3 ms (FZ_REQ_TRACE: parse 0.15-0.3, pipe to the engine 0.2-0.4, add ->
+step 0.02), and the client's TTFT adds ~2.5 ms of HTTP / Invarix. So ~95 % is the forward. Its layers: one NeuronCore,
+3-layer shard model (pfk_bench) 1.409 ms per layer exact vs 1.063 act, i.e. ~28 x 0.35 = 9.7 ms of the forward is the exact
+exp; the profile shows VectorE 0.70 ms busy per layer exact vs 0.24 act. By `scripts/nki_prefill_cost.py` (128 rows / 128
+slots, model) PFAttn's VectorE time is 265 us exact vs 55 act, nearly all nki.exact_exp's ~35 instructions per q head on
+(128, 128) and (128, 1) tiles (VectorE's fixed ~0.14 us per instruction dominates such tiles), and PFMLP's silu chain per
+512-column slice keeps 479 us of VectorE on the MLP's critical path (act: 111).
+- **Built** (each keeps every element's instruction sequence: same ops, order and immediates; main's kernels byte for byte
+  with all off; defaults since run 1 below): `FZ_NEURON_PFK_ATTN_HB` (2048; 0 = main) PFAttn runs a group of q heads (2048 // key block width: 14 at
+  128 slots, 4 at 512) through ONE exact exp for the alphas and one for the probabilities per key block, the running max /
+  sum on (rows, heads) tiles, q in and o out by one DMA per group; `FZ_NEURON_PFK_SILU` (default 512 = main; 2048: one silu(gate)
+  * up chain per gate / up block: off, slower on the chip); `FZ_NEURON_PFK_EXPF` (1; 0 = main) nki.exact_exp's fused form in the prefill kernels: the
+  clamp as one two-op tensor_scalar (max, min) and each power's exponent bits (k + 127) * 2**23 as one two-op tensor_scalar
+  written to int32 (exact integers below 2**31), 30 instead of 35 instructions; `FZ_NEURON_EMBED_BF16` (1; 0 = main) a
+  prefill forward uploads its token rows in the table's bf16 bits (0.9 MB instead of 1.8: under FZ_NEURON_QWRITE_MAX, so
+  the write rides in the launch's round trip) and widens them in the forward (exact; only for a bf16 table). Act mode is
+  unchanged. The self-test's fallback levels 2 / 3 turn the kernel forms off should a chip refuse them.
+- **Model, not measured** (per layer, 128 rows / 128 slots): 1.604 -> 1.314 ms (hb 1.446, silu 1.518, xf 1.529 alone;
+  act 1.117); 256 / 512 / 1024 slots 1.680 / 1.838 / 2.331 -> 1.392 / 1.553 / 1.889; 512 rows / 512 slots 5.680 -> 4.844.
+  Calibrated by I78's measured exact / act layers (x0.71 on the model's difference): -0.21 ms per layer, ~-5.8 ms per
+  128-row forward (hb ~3.1, silu ~1.7, xf ~1.5; not additive), the bf16 upload ~0.3-1 ms (estimate). SBUF peak 54 -> 89.5
+  KiB per partition at 128 rows (onchip_peak), PSUM unchanged.
+- **Tests** (NKISHIM, FZ_NKISHIM_MM=f64): fused exact exp == unfused over the float32 range; PFAttn batched == per head
+  (key block, row and group tails, masked rows, Llama-8B's layout); PFMLP wide silu == slices; the forward on v2 + I69 ==
+  v2 main == the members bit for bit (one device; TP=2 through the existing test, now on the defaults); the bf16 upload's
+  prefill_bench hashes and tokens == the float32 upload's; the on-chip budgets with the I69 forms.
+- **inf2 run 1** (14 Nov, `--i69`; every variant bitwise vs the members and main): single-core layer at 128 rows / 128 slots
+  main 1.408 ms, +hb 1.330, +silu 1.457 (slower: the model said faster), +xf 1.401, all four 1.378; at 512 slots all four
+  1.662 vs main 1.600 (slower). In process TP=2: 128@128 forward 49.8 -> 48.81 ms, TTFT c1 p50 51.1 -> 50.21 (all four).
+  The summary picked ATTN_HB=2048, SILU=512, EXPF=1 (the bf16 upload was not measured on its own). So the model
+  overstated the gains (~1 ms per forward measured vs ~6 modelled): VectorE's fixed cost per instruction is smaller on
+  inf2 than the trn1-fitted ve_fix, and the wide silu tiles cost more than they save. Both served phases failed: the
+  instance had no Invarix licence (`nki_n6b_lib.sh` now exports `.scratch/licence/chip-runs.lic`, gitignored,
+  when present). **Defaults now:** ATTN_HB 2048, SILU 512 (off), EXPF 1, EMBED_BF16 1.
+  `nki_n8_prefill_inf2.sh --i69-served` (~38 min): main vs the new defaults in process (bits), then served.
+- **Job** `nki_n8_prefill_inf2.sh --i69` (~45 min; cost guard in the script): single-core bench of each flag (device ms, bits vs
+  the members), in process main vs the candidate (every prefill prefix's logits hash, 128-token TTFT, greedy 24 x 64), a
+  kernels-only fallback when the candidate is not bitwise or not faster, served chosen (Invarix gate, short c1 / c4,
+  accuracy) and served main; `scripts/nki_n8_i69_summary.py` picks the fastest bitwise variant and states the bar.
+- **Served follow-up (I69 run 2 merged: served 52.15 ms).** Of the served 52.15 ms, 45.24 is the
+  prefill execute; the rest is host: ~2.5 ms in the step outside the runtime worker (with the 0.9 MB token-row upload),
+  ~1.3 ms client -> handler and ~1.2 ms first output -> client (h11 + asyncio). Built, default off: `FZ_SERVE_HTTP=fast`
+  (httptools + uvloop), `FZ_SERVE_ACCESS_LOG=0`, `FZ_SERVE_EARLY_HEADERS=1`, `FZ_SERVE_GC=freeze`
+  (`fusezap/serve/hostpath.py`), and `FZ_NEURON_EMBED_DEV=1` (`nki_prefill.EmbedGather`: the prefill's token rows
+  gathered from a device copy of the bf16 table by one indirect row DMA per token, exception 11; the bf16 upload's bits;
+  checked at engine start, off on failure). Job `nki_n8_prefill_inf2.sh --i69-ttft`.
+
 **N7 effort record (this model, TP).**
 - Backend lines (`device/neuron.py`, `codegen/nki.py`): neuron.py +21 / -4 (collective load flag, "ar" queued like a launch,
   the all-reduce kept out of fusion unless asked, the cross-process compile lock); nki.py 0. Other device files: the
@@ -647,6 +708,55 @@ theta 5e5); 32 / 8 heads (group 4; 16 / 4 per TP=2 rank) vs 28 / 4; D 4096, I 14
   both shape fixes that apply to any model with these sizes; 0 lines in `device/` (backend), `codegen/nki.py`, `models/`,
   the tokenizer, engine or API. New special cases: none keyed on the model (no `model_type` branch, no Llama flag in the
   job). Agent wall time ~1.4 h (Mac, no hardware; ~0.4 h of it test runs); the hardware time comes from the job.
+
+## 13. A structurally different family (I105): mixture of experts, OLMoE-1B-7B
+
+**Mac prep (2026-11-14, from main d9a0e46; hardware job `nki_olmoe_inf2.sh` pending; details the run's logs (not published)).**
+allenai/OLMoE-1B-7B-0125-Instruct (Apache-2.0): 64 experts of width 1024, top 8 per token (~1.3B of 6.9B parameters
+active), q/k RMSNorm over all heads, 16 / 16 heads, D 2048, 16 layers. bf16 device weights 12.8 GiB: one NeuronCore.
+- **Routing without runtime shapes (`serve/models/moe.py`).** The experts are stacked at load into one dense SwiGLU of width
+  64 x 1024; the router's softmax probabilities pass through a sort-free top-k (rank by an (N, 64, 64) compare and sum) and
+  multiply the activation per expert before down_proj, so unchosen experts add exact zeros. On NEURON that is a float32
+  router matmul, renderer elementwise / reduce kernels, and the same bf16 K-major expert matmuls a dense MLP uses: no
+  gather, no runtime loop bound or address. Price: every decode token reads all experts, 13.6 GB vs ~2.4 GB for the 8
+  chosen (**estimate** c1 69-107 ms/token on one core vs ~18 ms for per-expert kernels with the routing read back to the
+  host, which would break exception 9's one request per replay, or indirect DMA, which would be a new exception).
+- **Not on the fast paths.** LayerSpec and the prefill kernels v2 have no router and no q/k norm: MoE layers run the
+  members (fused per layer). No TP=2: the q/k norm spans every rank's heads.
+- **Mac results:** tiny HF OLMoE float32 greedy 32/32 on CPU and METAL; real weights, first 4 layers float32, 4 prompts x 32
+  tokens identical to HF on CPU and METAL; whole model METAL bf16 vs HF float32 compute top-1 0.9883 (256 positions), greedy
+  prefix mean 0.84; NKISHIM engine tokens == CPU float32 at OLMoE's head layout and at the real layer shapes (2 layers).
+- **OLMoE record (Mac part):** `fusezap/` +119 / -19 lines in 4 files: **backend (device/, codegen/nki*.py, nrt_worker) 0**;
+  model/serve `models/moe.py` +59 (new), `models/llama.py` +58 / -18, `models/__init__.py` +1 / -1,
+  `serve/neuron_prefill.py` +1 (no prefill-kernel self-test for an MoE model). New exceptions: none. Special cases keyed on the
+  model: `model_type == "olmoe"` in the config parser (expert count / width, full q/k norm); MoE / q-k-norm layers skip
+  LayerSpec and the prefill kernels; TP refused. Agent wall time ~0.6 h (Mac, no hardware; ~0.25 h of it test runs).
+
+**OLMoE chip run 1 and expert parallelism (I105 follow-up).** Run 1 on one core: NRT_RESOURCE, core 0 at 15.88 GB, of which
+2.16 GB was DMA rings (io). The routing's broadcasts (the weights over each expert's 1024 columns, the rank's (N, 64, 64)
+operands) rendered as stride-0 innermost DMA patterns, apparently one descriptor per element: 537 MB at 128 rows. That is
+the size match; it is not confirmed on hardware. Fix:
+- On NEURON both operands are now exact 0/1 TensorE matmuls (`moe.repeat_matrix`, `moe.pair_matrices`), the same bits.
+- The model runs **expert parallel over the two cores**: 32 experts per core, attention / norms / router / lm_head whole on
+  each core. The only collective is one all-reduce per layer, of the expert output.
+- Reduction order: each rank's half of down_proj's K in order, then rank 0 + rank 1. Equal to one core within float32
+  rounding, not bitwise.
+
+Estimated ~8.0-8.4 GB per core. Follow-up record: backend 0 lines; `models/llama.py` +26 / -11, `models/moe.py` +49 / -10;
+new exceptions none; ~0.5 h on the Mac.
+
+**Sliding-window attention (I105 part B, Mac; model not chosen: Gemma 3's licence is not accepted on the token; details
+the run's logs (not published)).** Generic windows (`LlamaConfig.layer_windows`: Gemma 3 5:1 local / global, OLMo 3 3:1, Mistral's
+all-layer window) and the layer variants that come with them (sandwich / post-only RMSNorm, (1 + w) norms, per-head and
+full q/k norm on the members, sqrt(D) embedding scale, GELU, per-layer RoPE theta, YaRN). On NEURON the window needs **no
+kernel line**: exception 8's keyrange attention already masks each row by [lo, hi], so the step metadata gets a second lo
+per row (row * stride + max(0, pos - W + 1)) and a windowed layer's AttnSpec points at it. NKISHIM engine tokens == CPU
+float32 for random Gemma 3 / OLMo 3 checkpoints with window 8 (the window changes the tokens). These layers run the members
+(LayerSpec and the prefill kernels v2 are written for the plain Llama layer). **Sliding-window record (Mac part):**
+`fusezap/` backend 0 lines; model/serve `models/swa.py` +77, `models/llama.py` +131 / -40, `serve/kv_cache.py` +15 / -10
+(MSL / numpy paged attention), `serve/neuron_kv.py` +13 / -3, `serve/engine.py` +4 / -5, `models/__init__.py` +2 / -1. New
+exceptions: none. Agent wall time ~0.2 h. OLMo-3-7B does not fit one core with margin (~15.0 of 15.25 GiB after a scoring
+request, estimate) and TP is refused for its full q/k norm; Gemma-3-1B needs ~2.1 GB.
 
 ## Sources
 1. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/index.html

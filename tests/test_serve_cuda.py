@@ -799,7 +799,7 @@ def test_engine_prefill_sizes_tokens_identical(m16):
   prompts = [rng.integers(100, 30000, k).tolist() for k in (3, 300, 70, 129, 400, 9, 256, 33)]
   ps = SamplingParams(max_tokens=10, ignore_eos=True)
   eng = LLMEngine(m16, num_blocks=512, block_size=16, max_num_seqs=8, max_prefill_tokens=1024)
-  assert eng.prefill_sizes == [256, 512, 1024]
+  assert eng.prefill_sizes == [128, 256, 512, 1024]   # W15 default minimum 128
   used: list[int] = []
   orig = type(eng._prefill).__call__   # called through the class, so the spy wraps it there
   def spy(self, tokens, sel, *a, **k):   # decode forwards pass more arguments (lookahead, speed run 4)
@@ -814,6 +814,12 @@ def test_engine_prefill_sizes_tokens_identical(m16):
     assert one.generate(prompts, ps) == together, f"one {P}-row prefill size"
   assert [eng.generate([p], ps)[0] for p in prompts] == together
 
+def _row_seq(tokens, r: int) -> int:
+  """The sequence id of step row r: the engine passes _Rows (arrays sid / pos / ids) since adcce38 (speed run 4); the
+  helper indexed it as the old list of (seq_id, pos, token) tuples and failed with "'_Rows' object is not subscriptable"
+  (W15 pod A3, the first GPU run of these slow tests since then)."""
+  return int(tokens.sid[r]) if hasattr(tokens, "sid") else int(tokens[r][0])
+
 def _first_logits(eng, prompts: list[list[int]]) -> tuple[list[np.ndarray], list[int]]:
   """Each prompt's first-token logits row, read off the prefill forwards, and the forwards' row counts."""
   from fusezap.serve.engine import SamplingParams
@@ -826,7 +832,7 @@ def _first_logits(eng, prompts: list[list[int]]) -> tuple[list[np.ndarray], list
     if self.eng is eng and self.prefill:
       sizes.append(self.N)
       lg = out.lg.numpy().reshape(self.R, -1)
-      for i, r in enumerate(sel): got[tokens[r][0]] = lg[i].copy()
+      for i, r in enumerate(sel): got[_row_seq(tokens, r)] = lg[i].copy()
     return out
   cls.__call__ = spy
   try:
@@ -847,7 +853,7 @@ def test_engine_f32_prefill_sizes_bit_identical():
   from fusezap.serve.engine import LLMEngine
   m = load_model(MODEL, dtype=dtypes.float32, device=DEV, max_len=2048, prefill_chunk=128)
   eng = LLMEngine(m, num_blocks=512, block_size=16, max_num_seqs=4, max_prefill_tokens=2048)
-  assert eng.prefill_sizes == [256, 512, 1024, 2048]
+  assert eng.prefill_sizes == [128, 256, 512, 1024, 2048]   # W15 default minimum 128
   rng = np.random.default_rng(21)
   short, long_ = rng.integers(100, 30000, 400).tolist(), rng.integers(100, 30000, 1500).tolist()
   for _ in range(3):   # the third run of each size replays its capture
@@ -858,6 +864,35 @@ def test_engine_f32_prefill_sizes_bit_identical():
 
 @needs_model
 @pytest.mark.slow
+def test_engine_prefill_min_128_bit_identical(m16, monkeypatch):
+  """W15 (FZ_PREFILL_MIN=128): a 100-token prompt alone runs the 128-row prefill forward; batched with a 300-token
+  prompt it runs in a 512-row one: its first-token logits are bitwise equal (cuBLASLt's pinned algos extended to M =
+  128 unchanged, or 128 dropped), and greedy tokens equal a 256-minimum engine's."""
+  from fusezap.serve.engine import LLMEngine, SamplingParams
+  from fusezap.helpers import getenv
+  rng = np.random.default_rng(29)
+  short, long_ = rng.integers(100, 30000, 100).tolist(), rng.integers(100, 30000, 300).tolist()
+  prompts = [rng.integers(100, 30000, k).tolist() for k in (100, 128, 129, 300, 7)]
+  ps = SamplingParams(max_tokens=8, ignore_eos=True)
+  monkeypatch.setenv("FZ_PREFILL_MIN", "128"); getenv.cache_clear()
+  try:
+    eng = LLMEngine(m16, num_blocks=256, block_size=16, max_num_seqs=4, max_prefill_tokens=512)
+    print(f"W15 prefill sizes {eng.prefill_sizes}")
+    if eng.prefill_sizes[0] != 128: pytest.skip(f"128 dropped by the cuBLASLt self-check: {eng.prefill_sizes}")
+    for _ in range(3):   # the third run of each size replays its capture
+      (alone,), n1 = _first_logits(eng, [short])
+      (_, both), n2 = _first_logits(eng, [long_, short])
+      assert n1 == [128] and n2 == [512], (n1, n2)
+      np.testing.assert_array_equal(alone, both)
+    got = eng.generate(prompts, ps)
+    assert [eng.generate([p], ps)[0] for p in prompts] == got
+  finally:
+    monkeypatch.delenv("FZ_PREFILL_MIN"); getenv.cache_clear()
+  ref = LLMEngine(m16, num_blocks=256, block_size=16, max_num_seqs=4, max_prefill_tokens=512, prefill_buckets=[256, 512])   # the pre-W15 sizes
+  assert ref.prefill_sizes == [256, 512] and ref.generate(prompts, ps) == got
+
+@needs_model
+@pytest.mark.slow
 def test_engine_prefill_memory_planned(m16):
   """Review fix (run 2): each CUDA prefill size is its own jit and used to keep every intermediate of its forward alive
   (7B bf16 with 2048 prefill tokens then ran out of memory at warmup on a 24 GB card). Their intermediates now share
@@ -865,7 +900,7 @@ def test_engine_prefill_memory_planned(m16):
   from fusezap.serve.engine import LLMEngine, SamplingParams
   from fusezap.serve.api import warmup
   eng = LLMEngine(m16, num_blocks=512, block_size=16, max_num_seqs=8, max_prefill_tokens=1024)
-  warmup(eng)   # captures the larger sizes; two more short steps capture the 256-row one
+  warmup(eng)   # captures every size (its first short requests run the 128-row one)
   for _ in range(2): eng.generate([[1000 + i for i in range(40)]], SamplingParams(max_tokens=1))
   for n, f in eng._prefills.items():
     c = f.jit.captured
@@ -978,8 +1013,8 @@ def test_7b_serve_defaults_warm_up():
   eng = LLMEngine(m, num_blocks=a.num_blocks, block_size=a.block_size, max_num_seqs=a.max_num_seqs, max_prefill_tokens=a.max_prefill_tokens)
   free = Device[DEV].mem_free()
   print(f"7B serve defaults: prefill sizes {eng.prefill_sizes}, {free / 2**30:.1f} GiB free before warmup")
-  assert eng.prefill_sizes[0] == 256 and eng.prefill_sizes[-1] >= 1024
-  warmup(eng)   # captures every size above 256 (the 256-row one captures on the first short requests)
+  assert eng.prefill_sizes[0] == 128 and eng.prefill_sizes[-1] >= 1024   # W15 default minimum 128
+  warmup(eng)   # captures every size above 128 (the 128-row one captures on the first short requests)
   assert all(eng._prefills[n].jit.captured is not None for n in eng.prefill_sizes[1:])
   rng = np.random.default_rng(4)   # then serve: a full largest-size step and short ones, replayed
   out = eng.generate([rng.integers(100, 30000, k).tolist() for k in (eng.prefill_sizes[-1] - 40, 30, 7)], SamplingParams(max_tokens=8, ignore_eos=True))

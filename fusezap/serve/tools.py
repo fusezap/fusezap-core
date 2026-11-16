@@ -7,6 +7,7 @@
                                        # for grammar-constrained decoding (CallConstraint); None for "none" / "auto"
   tool_calls, content = parse(spec, text)
   stream_kind(spec, text_so_far)       # llama3_json streams: "tool" | "content" | None (undecided, keep buffering)
+  hermes_split(spec, held, final)      # hermes streams: (content to send now, text still held, a call started)
 
 Formats (picked from the tokenizer's vocabulary and chat template, not the model name):
   hermes       Qwen2.5 (and other Hermes-style templates): `<tool_call>\\n{"name": ..., "arguments": {...}}\\n</tool_call>`,
@@ -222,10 +223,33 @@ def stream_kind(spec: ToolSpec, text: str, final: bool = False) -> str | None:
   if not s or LLAMA_TAG.startswith(s) or (s.startswith("[") and not s[1:].strip()): return None
   return "content"
 
+HERMES_TAG = "<tool_call>"
+
+def hermes_split(spec: ToolSpec, held: str, final: bool = False) -> tuple[str, str, bool]:
+  """For a live hermes stream: (content to send now, text to keep holding, a call has started). Content streams until
+  `<tool_call>` appears; from there the choice is held to its end and parsed as parse() does (so the stream carries
+  the same calls as the non-streamed reply; a block that does not parse is sent as content then). Held back meanwhile:
+  trailing whitespace and a partial `<tool_call>` at the end (the reply's content before a call is stripped, as
+  _parse_hermes strips it). A named / required tool_choice starts inside the call (forced prefix): held from the start.
+  final: the output is complete, so whatever is held and not a call is content."""
+  if spec.forced_prefix: return "", held, True
+  i = held.find(HERMES_TAG)
+  if i >= 0:
+    c = held[:i].rstrip()
+    return c, held[len(c):], True   # the whitespace before the tag stays held: content again if the call does not parse
+  if final: return held, "", False
+  k = len(held)
+  for n in range(min(len(HERMES_TAG) - 1, len(held)), 0, -1):
+    if HERMES_TAG.startswith(held[-n:]): k -= n; break
+  k = len(held[:k].rstrip())
+  return held[:k], held[k:], False
+
 def streams_live(spec: ToolSpec) -> bool:
-  """llama3_json output is a call only when it starts as one, so its stream is sent live (content) or buffered only for
-  a call; the other formats allow text before the call, so their streams are sent once generation is done."""
-  return spec.active and spec.fmt == "llama3_json"
+  """llama3_json output is a call only when it starts as one, so its stream is sent live (content) or held only for a
+  call (stream_kind); hermes streams content live up to the first `<tool_call>` and holds the calls (hermes_split).
+  Mistral's [TOOL_CALLS] is a special token the streamed text does not carry, so its streams are sent once generation
+  is done."""
+  return spec.active and spec.fmt in ("llama3_json", "hermes")
 
 @dataclass(frozen=True)
 class CallConstraint:

@@ -35,7 +35,9 @@ _STATE: dict = {"ok": None, "why": "", "override": None, "knobs": None}
 # the self-test's fallbacks, most capable first: a level whose kernels fail to compile or to match their reference on the
 # device is replaced by the next (ScalarE PSUM evictions -> VectorE; then the exact exp too), and the ranks take the most
 # conservative level any of them needed
-FALLBACKS = ({}, {"evict": "vector"}, {"evict": "vector", "exp": "exact"})
+# I69: levels 2 and 3 also turn the wide exact-exp forms off (main's kernels), should they not compile on a chip
+I69_OFF = {"attn_hb": 0, "silu": 512, "expf": False}
+FALLBACKS = ({}, {"evict": "vector"}, {"evict": "vector", **I69_OFF}, {"evict": "vector", "exp": "exact", **I69_OFF})
 
 def kernel_mode() -> str:
   """FZ_NEURON_PREFILL_KERNEL (v2 default | v1), or the mode set_mode put (mirrored on every TP rank)."""
@@ -122,8 +124,9 @@ def big_fuse(N: int, pk: int) -> int:
 
 def _knobs() -> dict:
   """The kernels' knobs: the env (nki_prefill.pfk_*), then whatever fallback the self-test settled on."""
-  from fusezap.codegen.nki_prefill import pfk_banks, pfk_evict, pfk_exp, pfk_wn
-  return {"banks": pfk_banks(), "wn": pfk_wn(), "exp": pfk_exp(), "evict": pfk_evict(), **(_STATE.get("knobs") or {})}
+  from fusezap.codegen.nki_prefill import pfk_attn_hb, pfk_banks, pfk_evict, pfk_exp, pfk_expf, pfk_silu, pfk_wn
+  return {"banks": pfk_banks(), "wn": pfk_wn(), "exp": pfk_exp(), "evict": pfk_evict(), "attn_hb": pfk_attn_hb(), "silu": pfk_silu(),
+          "expf": pfk_expf(), **(_STATE.get("knobs") or {})}
 
 def layer_ok(model: Any, l: Any, N: int, x: Any) -> bool:
   """The prefill kernels cover this layer: bf16 K-major weights, no gate / up / down biases, float32 rows, head_dim <= 128
@@ -143,9 +146,10 @@ def specs(N: int, D: int, Hq: int, Hkv: int, hd: int, I: int, P: int, eps: float
   Wx = (Hq + 2 * Hkv + 1) * hd
   return {"qkv": K.PFQKV(N, D, Hq, Hkv, hd, float(eps), add, qkv_bias, kn["banks"], kn["wn"]),
           "kvw": KVWriteSpec(P, N, 4 * Hkv * hd // 2, Wx, Hq * hd),
-          "attn": K.PFAttn(N, Hq, Hkv, hd, P, float(scale), base, kn["exp"]),
+          "attn": K.PFAttn(N, Hq, Hkv, hd, P, float(scale), base, kn["exp"], int(kn.get("attn_hb", 0)), bool(kn.get("expf", False))),
           "o": K.PFLinear(N, D, Hq * hd, 0, 0, kn["banks"], kn["wn"]),
-          "mlp": K.PFMLP(N, D, I, float(eps), o_bias, kn["exp"], kn["banks"], kn["wn"], evict=kn.get("evict", "act"))}
+          "mlp": K.PFMLP(N, D, I, float(eps), o_bias, kn["exp"], kn["banks"], kn["wn"], evict=kn.get("evict", "act"),
+                         silu=int(kn.get("silu", K.TN)), expf=bool(kn.get("expf", False)))}
 
 def layer(cache: Any, i: int, x: Any, d: Any, l: Any, cos: Any, sin: Any, n_heads: int, scale: float, eps: float,
           all_reduce: Any = None) -> tuple[Any, Any]:
@@ -343,6 +347,7 @@ def gate(eng: Any, log: Any = None, rows: tuple | None = None, ctxs: tuple | Non
   fallback knobs). A tensor-parallel worker never drives it (rank 0's verdict reaches it). eng: anything with .model, .tp
   and (unless rows / ctxs are given) .prefill_sizes and .cache.ctx_buckets. Returns a line for the log ('' if nothing ran)."""
   if kernel_mode() != "v2" or _STATE["ok"] is not None: return ""
+  if getattr(getattr(getattr(eng, "model", None), "cfg", None), "n_experts", 0): return ""   # I105: MoE layers run the members
   tp = getattr(eng, "tp", None)
   if tp is not None and getattr(tp, "rank", 0) != 0: return ""
   log = log or (lambda m: print(m, file=sys.stderr, flush=True))

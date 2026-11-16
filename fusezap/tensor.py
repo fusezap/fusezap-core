@@ -643,6 +643,8 @@ class Tensor:
   def min(self, axis=None, keepdim: bool = False, *, dim=None) -> "Tensor":
     axis = _pick_axis(axis, dim)
     if self.dtype == dtypes.bool: return self.logical_not().max(axis, keepdim).logical_not()
+    if self.dtype.is_int and self.dtype.itemsize < 4:   # narrow ints: x - y is x + NEG(y) and NEG saturates on NKI (-lo -> hi), so reverse the order in int32
+      return (-1 - self.cast(dtypes.int32)).max(axis, keepdim).__rsub__(-1).cast(self.dtype)
     if self.dtype.is_unsigned: return (255 - self).max(axis, keepdim).__rsub__(255)
     if self.dtype.is_int: return (-1 - self).max(axis, keepdim).__rsub__(-1)   # ~x = -1-x: order-reversing, no overflow at the dtype min
     return -((-self).max(axis, keepdim))
@@ -676,6 +678,7 @@ class Tensor:
   def argmin(self, axis=None, keepdim: bool = False, *, dim=None) -> "Tensor":
     axis = _pick_axis(axis, dim)
     if self.dtype == dtypes.bool: return self.logical_not().argmax(axis, keepdim)
+    if self.dtype.is_int and self.dtype.itemsize < 4: return (-1 - self.cast(dtypes.int32)).argmax(axis, keepdim)   # see min()
     if self.dtype.is_unsigned: return (255 - self).argmax(axis, keepdim)
     if self.dtype.is_int: return (-1 - self).argmax(axis, keepdim)
     return (-self).argmax(axis, keepdim)

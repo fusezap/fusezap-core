@@ -182,7 +182,7 @@ def test_stream_kind():
   assert [TL.stream_kind(sp, t) for t in ("{", ' {"na', "<|python_tag|>", "[{", "[ {")] == ["tool"] * 5
   assert [TL.stream_kind(sp, t) for t in ("The", " Sure {", "[1", "<|eot")] == ["content"] * 4
   assert TL.stream_kind(sp, " ", final=True) == "content" and TL.stream_kind(_spec("required"), "") == "tool"
-  assert TL.streams_live(sp) and not TL.streams_live(TL.ToolSpec([WEATHER], "auto", None, "hermes")) and not TL.streams_live(TL.ToolSpec())
+  assert TL.streams_live(sp) and TL.streams_live(TL.ToolSpec([WEATHER], "auto", None, "hermes")) and not TL.streams_live(TL.ToolSpec([WEATHER], "auto", None, "mistral")) and not TL.streams_live(TL.ToolSpec())
 
 def test_call_constraint_hook():
   """call_constraint: None for auto / none; for named / required the continuation it describes, appended to the forced

@@ -18,6 +18,8 @@ from fusezap.codegen import nki_prefill as K
 from fusezap.codegen.nki_bf16 import MatmulBF16
 from fusezap.serve import neuron_prefill as PF
 from fusezap.serve.weights import f32_to_bf16
+from fusezap.codegen.nki_kernels import HEADER
+from fusezap.dtype import dtypes
 
 TIER = "NKISHIM"
 Q7B = {"hidden_size": 256, "intermediate_size": 384, "num_attention_heads": 28, "num_key_value_heads": 4, "head_dim": 128}   # 14 / 2 per rank
@@ -33,10 +35,11 @@ def _r(rng, shape, sc=1.0): return (rng.standard_normal(shape) * sc).astype(np.f
 def _f64(monkeypatch):
   monkeypatch.setenv("FZ_NKISHIM_MM", "f64")
   for k in ("FZ_NEURON_PREFILL_KERNEL", "FZ_NEURON_PFK_EXP", "FZ_NEURON_PFK_HEAD", "FZ_NEURON_PFK_BANKS", "FZ_NEURON_PFK_WN",
-            "FZ_NEURON_PREFILL_SIZES", "FZ_NEURON_PFK_EVICT", "FZ_NEURON_PFK_SELFTEST"): monkeypatch.delenv(k, raising=False)
-  PF._STATE.update(ok=None, why="", override=None)
+            "FZ_NEURON_PREFILL_SIZES", "FZ_NEURON_PFK_EVICT", "FZ_NEURON_PFK_SELFTEST", "FZ_NEURON_PFK_ATTN_HB", "FZ_NEURON_PFK_SILU",
+            "FZ_NEURON_PFK_EXPF"): monkeypatch.delenv(k, raising=False)
+  PF._STATE.update(ok=None, why="", override=None, knobs=None)
   yield
-  PF._STATE.update(ok=None, why="", override=None)
+  PF._STATE.update(ok=None, why="", override=None, knobs=None)
 
 # ---------------------------------------------------------------- 1. kernels
 
@@ -148,13 +151,16 @@ def test_exp_act_within_tolerance():
 def test_onchip_budget_at_7b_shard_shapes(N, P):
   """Every kernel at Qwen2.5-7B's TP=2 shard shapes (D 3584, I 9472, 14 / 2 heads, head_dim 128) fits the on-chip memory by
   its live tiles (nki_prefill.onchip_peak): SBUF <= 176 KiB (nki_bf16.LAYER_SBUF of 192), PSUM <= 16 KiB (8 banks), in both
-  exp modes; the head's vocabulary window too."""
+  exp modes, with main's kernels and with I69's wide exact-exp forms; the head's vocabulary window too."""
+  seen: set = set()
   for exp in ("exact", "act"):
-    sp = PF.specs(N, 3584, 14, 2, 128, 9472, P, 1e-6, 0.088, 64, True, True, False, {"banks": 8, "wn": 4096, "exp": exp, "evict": "act"})
-    for nm, s in sp.items():
-      if nm == "kvw": continue
-      pk = K.onchip_peak(s.render(), s.sizes())
-      assert pk["sbuf"] <= 176 * 1024 and pk["psum"] <= 16 * 1024, (nm, exp, pk)
+    for i69 in ({}, {"attn_hb": 2048, "silu": 2048, "expf": True}):   # main's kernels, I69's
+      sp = PF.specs(N, 3584, 14, 2, 128, 9472, P, 1e-6, 0.088, 64, True, True, False, {"banks": 8, "wn": 4096, "exp": exp, "evict": "act", **i69})
+      for nm, s in sp.items():
+        if nm == "kvw" or (i69 and s.name in seen): continue   # I69's knobs leave this kernel as main's (act, 512 rows): checked
+        seen.add(s.name)
+        pk = K.onchip_peak(s.render(), s.sizes())
+        assert pk["sbuf"] <= 176 * 1024 and pk["psum"] <= 16 * 1024, (nm, exp, i69, pk)
   h = K.PFLinear(4, 76032, 3584, 152064, 76032)
   pk = K.onchip_peak(h.render(), h.sizes())
   assert pk["sbuf"] <= 176 * 1024 and pk["psum"] <= 16 * 1024, pk
@@ -163,12 +169,15 @@ def test_onchip_budget_at_7b_shard_shapes(N, P):
 def test_onchip_budget_at_llama8b_shard_shapes(N, P):
   """I13: the same at Llama-3.1-8B's TP=2 shard shapes (D 4096, I 7168, 16 / 4 heads, head_dim 128, no biases, eps 1e-5)
   and its split lm_head (128,256 / 2 = 64,128 vocabulary columns per rank)."""
+  seen: set = set()
   for exp in ("exact", "act"):
-    sp = PF.specs(N, 4096, 16, 4, 128, 7168, P, 1e-5, 0.088, 64, True, False, False, {"banks": 8, "wn": 4096, "exp": exp, "evict": "act"})
-    for nm, s in sp.items():
-      if nm == "kvw": continue
-      pk = K.onchip_peak(s.render(), s.sizes())
-      assert pk["sbuf"] <= 176 * 1024 and pk["psum"] <= 16 * 1024, (nm, exp, pk)
+    for i69 in ({}, {"attn_hb": 2048, "silu": 2048, "expf": True}):   # main's kernels, I69's
+      sp = PF.specs(N, 4096, 16, 4, 128, 7168, P, 1e-5, 0.088, 64, True, False, False, {"banks": 8, "wn": 4096, "exp": exp, "evict": "act", **i69})
+      for nm, s in sp.items():
+        if nm == "kvw" or (i69 and s.name in seen): continue   # I69's knobs leave this kernel as main's (act, 512 rows): checked
+        seen.add(s.name)
+        pk = K.onchip_peak(s.render(), s.sizes())
+        assert pk["sbuf"] <= 176 * 1024 and pk["psum"] <= 16 * 1024, (nm, exp, i69, pk)
   h = K.PFLinear(4, 64128, 4096, 128256, 64128)
   pk = K.onchip_peak(h.render(), h.sizes())
   assert pk["sbuf"] <= 176 * 1024 and pk["psum"] <= 16 * 1024, pk
@@ -571,7 +580,8 @@ def test_pfk_bench_applies_selftest_fallback(tmp_path, monkeypatch):
   sys.path.insert(0, os.path.join(ROOT, "scripts"))
   import nki_pfk_bench as B
   monkeypatch.setattr(Device, "DEFAULT", "NKISHIM")
-  for k in ("FZ_NEURON_FUSE", "FZ_NEURON_HEAD_FUSE", "FZ_NEURON_DTYPE", "FZ_NEURON_BF16_HEAD", "FZ_NEURON_PLAN", "FZ_NEURON_PFK_EXP"):
+  for k in ("FZ_NEURON_FUSE", "FZ_NEURON_HEAD_FUSE", "FZ_NEURON_DTYPE", "FZ_NEURON_BF16_HEAD", "FZ_NEURON_PLAN", "FZ_NEURON_PFK_EXP",
+            "FZ_NEURON_PFK_ATTN_HB", "FZ_NEURON_PFK_SILU", "FZ_NEURON_PFK_EXPF"):
     monkeypatch.setenv(k, "")   # the bench sets these: restored after the test
   monkeypatch.setenv("FZ_NEURON_PFK_EVICT", "act")
   seen = []
@@ -594,6 +604,361 @@ def test_pfk_bench_applies_selftest_fallback(tmp_path, monkeypatch):
   r = json.load(open(out / "pfk_bench.json"))["records"][0]
   assert "self-test failed" in r["error"] and "injected compile error" in r["error"]
 
+# ---------------------------------------------------------------- 5. I69: the exact exp in fewer, wider instructions
+
+I69_ON = {"attn_hb": 2048, "silu": 2048, "expf": True}
+I69_OFF = {"attn_hb": 0, "silu": 512, "expf": False}
+
+@pytest.mark.parametrize("base2", [True, False])
+def test_exact_exp_fused_bitwise(base2):
+  """nki.exact_exp's fused form (the clamp in one two-op tensor_scalar, each power's exponent bits in one, straight to int32)
+  gives the unfused form's bits over the whole float32 range: overflow, underflow into denormals and zero, the clamp
+  bounds, +-inf, NaN, tiny and huge arguments."""
+  from fusezap.codegen import nki
+  from fusezap.dtype import dtypes
+  rng = np.random.default_rng(1 if base2 else 2)
+  x = np.concatenate([rng.uniform(-300, 300, 3000), rng.uniform(-30, 30, 3000), rng.standard_normal(2000) * 1e-3,
+                      [0.0, -0.0, 1e-38, -1e-38, 1e-45, 252.0, -252.0, 254.0, 253.9, -149.5, -126.0, 127.99, 88.7, -87.3, -103.97,
+                       175.0, -175.0, 177.0, 1e30, -1e30, np.inf, -np.inf, np.nan]]).astype(np.float32)
+  x = np.resize(x, (128, -(-x.size // 128))).astype(np.float32)
+  outs = []
+  for fused in (False, True):
+    L = ["def k(data0, data1):", f"  x = nl.ndarray({x.shape}, dtype=nl.float32, buffer=nl.sbuf)",
+         f"  nisa.dma_copy(dst=x, src=data1.ap(pattern=[[{x.shape[1]}, {x.shape[0]}], [1, {x.shape[1]}]], offset=0))",
+         f"  d = nl.ndarray({x.shape}, dtype=nl.float32, buffer=nl.sbuf)"]
+    k = iter(range(100))
+    def new(dt):
+      nm = f"t{next(k)}"
+      if dt is not None: L.append(f"  {nm} = nl.ndarray({x.shape}, dtype=nl.{nki.nl_dtype(dt)}, buffer=nl.sbuf)")
+      return nm
+    nki.exact_exp(lambda ln: L.append("  " + ln), new, "d", "x", base2=base2, fused=fused)
+    L += [f"  nisa.dma_copy(dst=data0.ap(pattern=[[{x.shape[1]}, {x.shape[0]}], [1, {x.shape[1]}]], offset=0), src=d)", "  return data0"]
+    src = "\n".join(L)
+    assert ("op1=nl.minimum" in src) == fused and src.count("nisa.") < (60 if fused else 80)
+    prog = nki.NKIProgram("k", HEADER + src + "\n", 2, (0,), {0: dtypes.float32, 1: dtypes.float32})
+    o = np.zeros(x.size, np.float32)
+    S.execute(prog, [o, x.reshape(-1).copy()])
+    outs.append((o, src.count("nisa.")))
+  (a, na), (b, nb) = outs
+  np.testing.assert_array_equal(a.view(np.int32), b.view(np.int32))
+  assert na - nb == 5, (na, nb)   # the clamp 2 -> 1, each power 3 -> 1
+  fin = np.isfinite(x.reshape(-1)) & (np.abs(x.reshape(-1)) < 80)
+  with np.errstate(over="ignore"): want = np.exp2(x.reshape(-1).astype(np.float64)) if base2 else np.exp(x.reshape(-1).astype(np.float64))
+  assert np.max(np.abs(a[fin] - want[fin]) / want[fin]) < 4e-7   # still ~1 ulp
+
+@pytest.mark.parametrize("N,P,layout", [(128, 128, "qwen7b"), (128, 640, "qwen7b"), (160, 256, "qwen7b"), (64, 1024, "llama8b"), (16, 48, "qwen7b")])
+def test_i69_attention_bitwise_vs_per_head(N, P, layout):
+  """PFAttn with its exps batched over q heads (FZ_NEURON_PFK_ATTN_HB) and / or the fused exact exp (FZ_NEURON_PFK_EXPF):
+  main's per-head kernel bit for bit, over one or several key blocks (640, 1024 slots), a row tail (160 rows), group tails
+  (14 heads in groups of 4 / 8), a narrow prefix, a fully masked row and rows whose keys start mid-block."""
+  rng = np.random.default_rng(N + P)
+  Hq, Hkv, hd = (14, 2, 128) if layout == "qwen7b" else (16, 4, 128)
+  X, pool = _r(rng, (N, (Hq + 2 * Hkv + 1) * hd)), _r(rng, (P, 2 * Hkv * hd))
+  meta = _meta(N, P, 8, start=P - N)
+  meta[8 + N + 3] = -1                       # row 3: hi < lo, no key visible
+  meta[8 + 5] = P // 3; meta[8 + 7] = P - N  # rows 5, 7: a later first key
+  outs = {}
+  for hb, xf in ((0, False), (2048, False), (2048, True), (0, True), (256, True), (512, False)):
+    sp = K.PFAttn(N, Hq, Hkv, hd, P, 0.088, 8, "exact", hb, xf)
+    o = np.zeros(N * Hq * hd, np.float32)
+    S.execute(sp.render(), [o, X.reshape(-1), pool.reshape(-1), meta])
+    outs[(hb, xf)] = (o, sp)
+  ref, base = outs[(0, False)]
+  assert base.name == f"fz_pfattn_{N}_{Hq}_{Hkv}_{hd}_{P}" and base.heads_per_group == 0
+  for (hb, xf), (o, sp) in outs.items():
+    np.testing.assert_array_equal(o.view(np.int32), ref.view(np.int32), err_msg=sp.name)
+    assert (f"_hb{sp.heads_per_group}" in sp.name) == bool(hb) and sp.name.endswith("_xf") == xf, sp.name
+  assert outs[(2048, True)][1].heads_per_group == min(Hq, 2048 // min(512, P))
+  assert K.PFAttn(N, Hq, Hkv, hd, P, 0.088, 8, "act", 2048, True).name == f"fz_pfattn_{N}_{Hq}_{Hkv}_{hd}_{P}_act"   # act: unchanged
+
+@pytest.mark.parametrize("N,I", [(128, 1300), (160, 2600), (64, 384), (512, 1100)])
+def test_i69_mlp_bitwise_vs_slices(N, I):
+  """PFMLP with one silu chain per gate / up block (FZ_NEURON_PFK_SILU) and / or the fused exact exp: main's PFMLP (a chain
+  per 512-column slice) bit for bit, incl. column tails, row tails and a 512-row chunk (its blocks are 512 columns: no change)."""
+  rng = np.random.default_rng(N + I)
+  D = 256
+  x, o, ln2 = _r(rng, (N, D)), _r(rng, (N, D)), 1 + _r(rng, D, 0.1)
+  wgu, wd = f32_to_bf16(_r(rng, (D, 2 * I), 0.3)), f32_to_bf16(_r(rng, (I, D), 0.05))
+  outs = {}
+  for silu, xf in ((512, False), (2048, False), (1024, True), (2048, True), (512, True)):
+    sp = K.PFMLP(N, D, I, 1e-6, False, "exact", 8, 4096, evict="vector", silu=silu, expf=xf)
+    arrs = [np.zeros(N * D, np.float32), np.zeros(N * D, np.float32), x.reshape(-1), o.reshape(-1), ln2, wgu.reshape(-1), wd.reshape(-1)]
+    S.execute(sp.render(), arrs)
+    outs[(silu, xf)] = (arrs[0], arrs[1], sp)
+  rx, rd, base = outs[(512, False)]
+  for k, (ox, od, sp) in outs.items():
+    np.testing.assert_array_equal(ox.view(np.int32), rx.view(np.int32), err_msg=sp.name)
+    np.testing.assert_array_equal(od.view(np.int32), rd.view(np.int32), err_msg=sp.name)
+  sp = outs[(2048, True)][2]
+  assert sp.silu_cols == min(2048, sp.gu_cols) and sp.name.endswith(("_s2048_xf", "_s1024_xf", "_xf"))
+  assert ("_s" in sp.name) == (sp.silu_cols != 512) and "_s" not in base.name
+
+def test_i69_switches_and_fallbacks(monkeypatch):
+  """FZ_NEURON_PFK_ATTN_HB / _SILU / _EXPF: defaults (hb and xf on, wide silu off: slower on inf2), main's values, bad values;
+  the knobs reach the specs;
+  the self-test's fallback levels 2 and 3 turn them off (main's kernels) should they not compile on a chip; i69_env."""
+  assert (K.pfk_attn_hb(), K.pfk_silu(), K.pfk_expf()) == (2048, 512, True)
+  kn = PF._knobs()
+  assert {k: kn[k] for k in I69_ON} == {**I69_ON, "silu": 512}
+  sp = PF.specs(128, 3584, 14, 2, 128, 9472, 128, 1e-6, 0.088, 64, True, True, False)
+  assert sp["attn"].name.endswith("_hb14_xf") and sp["mlp"].name == "fz_pfmlp_128_3584_9472_b2048_4096_ev_xf", (sp["attn"].name, sp["mlp"].name)
+  for k, v in K.i69_env([]).items(): monkeypatch.setenv(k, v)
+  sp = PF.specs(128, 3584, 14, 2, 128, 9472, 128, 1e-6, 0.088, 64, True, True, False)
+  assert sp["attn"].name == "fz_pfattn_128_14_2_128_128" and sp["mlp"].name == "fz_pfmlp_128_3584_9472_b2048_4096_ev"
+  assert K.i69_env(["i69"]) == {"FZ_NEURON_PFK_ATTN_HB": "2048", "FZ_NEURON_PFK_SILU": "2048", "FZ_NEURON_PFK_EXPF": "1"}
+  assert K.i69_env(["hb"])["FZ_NEURON_PFK_SILU"] == "512"
+  with pytest.raises(ValueError): K.i69_env(["fast"])
+  for k, v in (("FZ_NEURON_PFK_ATTN_HB", "-1"), ("FZ_NEURON_PFK_SILU", "700"), ("FZ_NEURON_PFK_EXPF", "2")):
+    monkeypatch.setenv(k, v)
+    with pytest.raises(ValueError): PF._knobs()
+    monkeypatch.delenv(k)
+  assert PF.FALLBACKS[1] == {"evict": "vector"} and all({k: f[k] for k in I69_OFF} == I69_OFF for f in PF.FALLBACKS[2:])
+  PF.set_ok(None, True, "", PF.FALLBACKS[2])
+  assert {k: PF._knobs()[k] for k in I69_OFF} == I69_OFF
+  sp = PF.specs(128, 3584, 14, 2, 128, 9472, 128, 1e-6, 0.088, 64, True, True, False)
+  assert "_hb" not in sp["attn"].name and "_s2048" not in sp["mlp"].name and "_xf" not in sp["mlp"].name
+
+def test_i69_selftest_falls_back_to_main_kernels(tmp_path, monkeypatch):
+  """A chip whose compiler refuses the I69 forms (injected: a PFAttn with batched heads fails to render): the self-test runs
+  levels 0 and 1 (both I69), then settles on level 2, main's kernels with VectorE evictions."""
+  from fusezap.codegen.nki import NKIUnsupported
+  m, _ = _model(tmp_path, seed=13, layers=1)
+  orig = K.PFAttn.render
+  def picky(self):
+    if self.heads_per_group: raise NKIUnsupported("injected: batched heads")
+    return orig(self)
+  monkeypatch.setattr(K.PFAttn, "render", picky)
+  r = PF.selftest(type("G", (), {"device": "NKISHIM", "rank": 0})(), m, (56,), (112,), force=True)   # shapes no other test runs
+  assert r["ok"] and r["level"] == 2 and r["knobs"]["attn_hb"] == 0 and "injected" in r["tried"][0]["why"], r
+
+def test_i69_forward_bitwise_wide_mlp(tmp_path, monkeypatch):
+  """The serving forward with an intermediate size above one 512-column slice (1300: the silu chain spans the gate / up block)
+  and 14 / 2 heads: v2 with every I69 form (wide silu too) == v2 with main's kernels == the members, bit for bit, prefill
+  (two chunks) and the decode after it."""
+  monkeypatch.setenv("FZ_NEURON_PFK_EXP", "exact")
+  cfg = {**Q7B, "intermediate_size": 1300}
+  runs = {}
+  for lab, mode, env in (("v1", "v1", {}), ("main", "v2", K.i69_env([])), ("i69", "v2", K.i69_env(["i69"]))):
+    monkeypatch.setenv("FZ_NEURON_PREFILL_KERNEL", mode)
+    for k, v in env.items(): monkeypatch.setenv(k, v)
+    m, _ = _model(tmp_path, seed=14, cfg=cfg)
+    _two_chunks(m)
+    runs[lab] = (_two_chunks(m), _prefill_names(m))
+  for lab in ("main", "i69"):
+    for a, b in zip(runs["v1"][0], runs[lab][0]): np.testing.assert_array_equal(a.view(np.int32), b.view(np.int32), err_msg=lab)
+  assert any("_hb" in n for n in runs["i69"][1]) and any(n.startswith("fz_pfmlp") and "_s" in n and n.endswith("_xf") for n in runs["i69"][1]), runs["i69"][1]
+  assert not any("_hb" in n or n.endswith("_xf") for n in runs["main"][1]), runs["main"][1]
+
+def test_i69_embed_bf16_upload_bitwise(tmp_path, monkeypatch):
+  """FZ_NEURON_EMBED_BF16 (default on): with a bf16 embedding table the engine's prefill forwards upload the token rows as
+  bf16 (half the bytes) and widen them inside the forward: every prefill forward's logits bits (scripts/nki_n6_serve.py
+  prefill_bench, each prefix) and the greedy tokens equal the float32 upload's; decode forwards and a float32 table keep
+  the float32 upload."""
+  import sys
+  sys.path.insert(0, os.path.join(ROOT, "scripts"))
+  import nki_n6_serve as S6
+  from fusezap.serve import neuron_kv as NK
+  from fusezap.serve.engine import LLMEngine, SamplingParams
+  from fusezap.serve.weights import STArray
+  monkeypatch.setenv("FZ_NEURON_PREFILL_SIZES", "32")
+  monkeypatch.setenv("FZ_NEURON_PREFILL_CTX", "32,64")
+  seen = []
+  orig = NK.upload
+  monkeypatch.setattr(NK, "upload", lambda a, device, dtype: seen.append((a.shape, dtype)) or orig(a, device, dtype))
+  out, toks = {}, {}
+  for flag in ("0", "1"):
+    monkeypatch.setenv("FZ_NEURON_EMBED_BF16", flag)
+    m, _ = _model(tmp_path, seed=15, layers=1)
+    assert not NK.embed_bf16(m)   # the tiny checkpoint's table is float32: never rounded to bf16
+    tb = f32_to_bf16(np.asarray(m.embed_host, np.float32)).view(STArray)   # the same table as bf16 (a real checkpoint's)
+    tb.st_dtype = "BF16"
+    m.embed_host = tb
+    assert NK.embed_bf16(m) == (flag == "1")
+    e = LLMEngine(m, num_blocks=8, block_size=16, max_num_seqs=2, max_prefill_tokens=64, decode_beam=0)
+    assert e.embed_bf16 == (flag == "1")
+    seen.clear()
+    out[flag] = S6.prefill_bench(e, 1)
+    assert any(dt == dtypes.bfloat16 for _, dt in seen) == (flag == "1"), seen
+    rids = [e.add_request(list(np.random.default_rng(i).integers(0, 199, n)), SamplingParams(max_tokens=6)) for i, n in ((1, 20), (2, 45))]
+    while e.has_unfinished(): e.step()
+    toks[flag] = [list(e.seqs[r].output) for r in rids]
+  assert out["0"].keys() == out["1"].keys() and out["0"]
+  for k in out["0"]: assert out["0"][k]["logits_sha"] == out["1"][k]["logits_sha"], k
+  assert toks["0"] == toks["1"], toks
+
+def test_i69_job_mode_and_summary(tmp_path):
+  """scripts/nki_n8_prefill_inf2.sh --i69: bash -n, its own results dir, budget and launch guard (<= $2.50, the self-stop
+  grace included), the phases in order (single-core bench, main, cand, the kernels-only fallback, the choice, served chosen
+  with accuracy, served main), every phase on 128-row prefill forwards; scripts/nki_n8_i69_summary.py's choice (bitwise and
+  faster, else main), the kernels-only env from the bench and the bar on synthetic result files."""
+  import csv, subprocess, sys
+  sh = os.path.join(ROOT, "scripts", "nki_n8_prefill_inf2.sh")
+  assert subprocess.run(["bash", "-n", sh]).returncode == 0
+  src = open(sh).read()
+  start = src.index('if [ "$I69" = 1 ]; then')
+  blk = src[start:src.index("\nfi\n", start)]
+  assert "results/nki_n8_i69" in src and "FZ_PF_BUDGET_MIN:-52" in src and "--max-hours 1.05 --max-usd 2.5 --hf-token -- \"bash scripts/nki_n8_prefill_inf2.sh --i69\"" in src
+  assert (1.05 + 0.17) * 1.996 <= 2.5   # the launch guard: max hours + the 10 min self-stop grace at inf2.8xlarge's $1.996/h
+  order = ["phase pfk_bench", "i69_variant main", "i69_variant cand", "i69_variant kern", "tp_phase fzhttp_i69_chosen", "tp_phase fzhttp_i69_main", "nki_n8_i69_summary.py \"$OUT\" --json"]
+  assert [blk.index(x) for x in order] == sorted(blk.index(x) for x in order)
+  assert "FZ_NEURON_PFK_ATTN_HB=0 FZ_NEURON_PFK_SILU=512 FZ_NEURON_PFK_EXPF=0 FZ_NEURON_EMBED_BF16=0" in blk
+  assert "FZ_NEURON_PFK_ATTN_HB=2048 FZ_NEURON_PFK_SILU=2048 FZ_NEURON_PFK_EXPF=1 FZ_NEURON_EMBED_BF16=1" in blk
+  assert blk.count("FZ_NEURON_PREFILL_SIZES=128") >= 2 and "FZ_NEURON_PREFILL_SIZES=128 \"$@\"" in src and "--prefill-bench 5" in blk
+  assert "fz7b_http tp2_bf16_7b_i69_chosen auto" in blk and "fz7b_http tp2_bf16_7b_i69_main none" in blk
+  # the env words the job uses are the ones the code reads
+  for k, v in K.i69_env(["i69"]).items(): assert f"{k}={v}" in blk
+  for k, v in K.i69_env([]).items(): assert f"{k}={v}" in blk
+  def bench(sha: str, w128: float, extra: dict | None = None) -> dict:
+    pb = {f"128@{c}": {"rows": 128, "ctx": c, "tokens": 128, "wall_ms_min": w128 + (c - 128) / 50, "top": 5, "logits_sha": f"{sha}{c}"} for c in (128, 256, 512, 1024)}
+    return {"prefill_bench": pb, "ttft_by_len": {"128": {"c1_p50": w128 + 1, "c4_p99": 4 * w128, "c1_ids": [1, 2], "c4_ids": [3, 4, 5, 6]}},
+            "c1": {"tpot_ms_median": 38.6}, "greedy": {"rows": [{"id": "p0", "ids": [7, 8, 9]}]}, **(extra or {})}
+  with open(tmp_path / "i69_variants.tsv", "w") as f:
+    f.write("main\tFZ_NEURON_PFK_ATTN_HB=0 FZ_NEURON_EMBED_BF16=0\ncand\tFZ_NEURON_PFK_ATTN_HB=2048 FZ_NEURON_EMBED_BF16=1\n")
+  for n, v in (("main", bench("a", 51.3)), ("cand", bench("a", 45.2))):
+    with open(tmp_path / f"serve_i69_{n}.json", "w") as f: json_dump(v, f)
+  os.makedirs(tmp_path / "pfk_bench")
+  recs = [{"config": "v1:128:128", "path": "v1", "ctx": 128, "layer_device_ms": 2.43, "logits_bitwise_vs_v1": True},
+          {"config": "v2exact:128:128", "path": "v2exact", "ctx": 128, "layer_device_ms": 1.41, "logits_bitwise_vs_v1": True},
+          {"config": "v2exact+hb:128:128", "path": "v2exact+hb", "ctx": 128, "layer_device_ms": 1.30, "logits_bitwise_vs_v1": True},
+          {"config": "v2exact+silu:128:128", "path": "v2exact+silu", "ctx": 128, "layer_device_ms": 1.44, "logits_bitwise_vs_v1": True},
+          {"config": "v2exact+xf:128:128", "path": "v2exact+xf", "ctx": 128, "layer_device_ms": 1.36, "logits_bitwise_vs_v1": False}]
+  with open(tmp_path / "pfk_bench" / "pfk_bench.json", "w") as f: json_dump({"records": recs}, f)
+  def write(lab: str, rows: list, dec: str | None = None) -> None:
+    d = tmp_path / f"fz_tp2_bf16_7b_i69_{lab}_perf"
+    d.mkdir(exist_ok=True)
+    with open(d / "performance.csv", "w", newline="") as f:
+      w = csv.DictWriter(f, ["workload", "concurrency", "errors", "output_tok_s", "ttft_p50_ms", "ttft_p99_ms", "tpot_p50_ms"])
+      w.writeheader()
+      for c, p50, p99, tpot, tok in rows: w.writerow({"workload": "short", "concurrency": c, "errors": 0, "output_tok_s": tok, "ttft_p50_ms": p50, "ttft_p99_ms": p99, "tpot_p50_ms": tpot})
+    if dec:
+      (tmp_path / f"fz_tp2_bf16_7b_i69_{lab}_acc").mkdir(exist_ok=True)
+      with open(tmp_path / f"fz_tp2_bf16_7b_i69_{lab}_acc" / "report.json", "w") as f: json_dump({"decision": {"label": dec}}, f)
+  write("chosen", [(1, 49.0, 50.1, 38.5, 25.9), (4, 130.0, 205.0, 39.2, 100.2)], "PROMOTE")
+  write("main", [(1, 55.2, 56.4, 38.5, 25.8), (4, 145.0, 236.0, 39.3, 99.7)])
+  script = os.path.join(ROOT, "scripts", "nki_n8_i69_summary.py")
+  run = lambda *x: subprocess.run([sys.executable, script, str(tmp_path), *x], capture_output=True, text=True)
+  r = run("--choose")
+  assert r.returncode == 0 and r.stdout.split("\t")[0] == "cand" and "EMBED_BF16=1" in r.stdout, r.stdout + r.stderr
+  assert run("--kern-env").stdout.strip() == "FZ_NEURON_PFK_ATTN_HB=2048 FZ_NEURON_PFK_SILU=512 FZ_NEURON_PFK_EXPF=0 FZ_NEURON_EMBED_BF16=0"
+  r = run("--json", str(tmp_path / "s.json"))
+  assert r.returncode == 0 and "RECOMMEND cand" in r.stdout and "DO NOT" not in r.stdout, r.stdout + r.stderr
+  assert "saves 3.08 ms per 28 layers vs v2exact" in r.stdout and "costs 0.84 ms" in r.stdout   # +hb (1.41 - 1.30) x 28; +silu
+  cand = bench("a", 45.2); cand["prefill_bench"]["128@512"]["logits_sha"] = "z"   # one forward's bits differ: main is chosen
+  with open(tmp_path / "serve_i69_cand.json", "w") as f: json_dump(cand, f)
+  assert run("--choose").stdout.startswith("main\t") and "forward 128@512" in run("--choose").stderr
+  assert "DO NOT RECOMMEND main" in run().stdout
+  cand = bench("a", 45.2); cand["greedy"]["rows"][0]["ids"] = [7, 8, 1]
+  with open(tmp_path / "serve_i69_cand.json", "w") as f: json_dump(cand, f)
+  assert run("--choose").stdout.startswith("main\t")
+  with open(tmp_path / "serve_i69_cand.json", "w") as f: json_dump(bench("a", 52.0), f)   # bitwise but slower: main
+  assert run("--choose").stdout.startswith("main\t")
+
+def test_i69_served_job_mode_and_licence():
+  """scripts/nki_n8_prefill_inf2.sh --i69-served: bash -n, its own results dir, 40 min budget and launch guard (<= $2.00 with
+  the self-stop grace), no single-core bench, in process main then the new defaults (the code's, spelled out), the choice,
+  served chosen with accuracy, served main perf; scripts/nki_n6b_lib.sh exports the chip-run licence when it exists and no
+  licence is set (run 1's served phases failed without one), and the licence file is gitignored, never tracked."""
+  import subprocess
+  sh = os.path.join(ROOT, "scripts", "nki_n8_prefill_inf2.sh")
+  assert subprocess.run(["bash", "-n", sh]).returncode == 0
+  src = open(sh).read()
+  start = src.index('if [ "$I69S" = 1 ]; then')
+  blk = src[start:src.index("\nfi\n", start)]
+  assert "results/nki_n8_i69s" in src and "FZ_PF_BUDGET_MIN:-40" in src
+  assert "--max-hours 0.8 --max-usd 2.0 --hf-token -- \"bash scripts/nki_n8_prefill_inf2.sh --i69-served\"" in src
+  assert (0.8 + 0.17) * 1.996 <= 2.0
+  order = ["i69_variant main", "i69_variant new", "nki_n8_i69_summary.py \"$OUT\" --choose", "tp_phase fzhttp_i69_chosen", "tp_phase fzhttp_i69_main"]
+  assert [blk.index(x) for x in order] == sorted(blk.index(x) for x in order) and "pfk_bench" not in blk
+  new = "FZ_NEURON_PFK_ATTN_HB=2048 FZ_NEURON_PFK_SILU=512 FZ_NEURON_PFK_EXPF=1 FZ_NEURON_EMBED_BF16=1"
+  assert new in blk and "fz7b_http tp2_bf16_7b_i69_chosen auto" in blk
+  assert new.split() == [f"{k}={v}" for k, v in (("FZ_NEURON_PFK_ATTN_HB", K.pfk_attn_hb()), ("FZ_NEURON_PFK_SILU", K.pfk_silu()),
+                                                 ("FZ_NEURON_PFK_EXPF", int(K.pfk_expf())), ("FZ_NEURON_EMBED_BF16", 1))]   # the code defaults
+  lib = os.path.join(ROOT, "scripts", "nki_n6b_lib.sh")
+  probe = 'cd "$1"; . scripts/nki_n6b_lib.sh; echo "LIC=${FUSEZAP_LICENSE_FILE:-}"'
+  def run(d, env):
+    r = subprocess.run(["bash", "-c", probe.replace("scripts/nki_n6b_lib.sh", lib), "x", str(d)], capture_output=True, text=True,
+                       env={k: v for k, v in {**os.environ, **env}.items() if v is not None})
+    return r.stdout.strip().splitlines()[-1]
+  import tempfile
+  with tempfile.TemporaryDirectory() as d:
+    env = {"FUSEZAP_LICENSE_FILE": None}
+    assert run(d, env) == "LIC="
+    os.makedirs(os.path.join(d, ".scratch", "licence"))
+    open(os.path.join(d, ".scratch", "licence", "chip-runs.lic"), "w").write("x")
+    got = run(d, env)
+    assert got.startswith("LIC=") and os.path.samefile(got[4:], os.path.join(d, ".scratch", "licence", "chip-runs.lic")), got
+    assert run(d, {"FUSEZAP_LICENSE_FILE": "/given.lic"}) == "LIC=/given.lic"
+  r = subprocess.run(["git", "check-ignore", "-q", ".scratch/licence/chip-runs.lic"], cwd=ROOT)
+  assert r.returncode == 0
+  assert subprocess.run(["git", "ls-files", ".scratch"], cwd=ROOT, capture_output=True, text=True).stdout == ""
+
 def json_dump(v, f):
   import json
   json.dump(v, f)
+
+# ---------------------------------------------------------------- I69 follow-up: the prefill's token rows gathered on the device
+
+@pytest.mark.parametrize("N,V,D", [(128, 1000, 384), (130, 333, 200), (5, 70, 3584)])
+def test_embed_gather_kernel_exact(N, V, D):
+  """EmbedGather: row n of the output is table row ids[n], widened bf16 -> float32 bit for bit (two row blocks at 130
+  tokens; repeated ids; the first and last rows; padding id 0)."""
+  rng = np.random.default_rng(N + V)
+  tab = f32_to_bf16(_r(rng, (V, D)))
+  ids = rng.integers(0, V, N); ids[0], ids[-1] = V - 1, 0; ids[N // 2] = ids[1]
+  x = np.full(N * D, np.nan, np.float32)
+  S.execute(K.EmbedGather(N, V, D).render(), [x, K.embed_offsets(ids, D).reshape(-1), tab.reshape(-1)])
+  want = (tab[ids].astype(np.uint32) << 16).view(np.float32)
+  np.testing.assert_array_equal(x.reshape(N, D).view(np.int32), want.view(np.int32))
+  assert K.EmbedGather(N, V, D).sizes() == [N * D, N, V * D]
+  with pytest.raises(Exception): K.EmbedGather(4, 2 ** 20, 4096).render()   # offsets past int32
+
+def test_embed_dev_engine_bitwise(tmp_path, monkeypatch):
+  """FZ_NEURON_EMBED_DEV=1 (default 0): with a bf16 table the prefill forwards take N int32 offsets and gather their rows
+  on the device (EmbedGather inside the captured forward), so no (N, D) token rows are uploaded: every prefill forward's
+  logits bits at each prefix (nki_n6_serve.py prefill_bench) and the greedy tokens equal the bf16 upload's (I69's
+  default); the gather's check failing (injected) turns it off with a message and the upload stays."""
+  import sys
+  sys.path.insert(0, os.path.join(ROOT, "scripts"))
+  import nki_n6_serve as S6
+  from fusezap.serve import neuron_kv as NK
+  from fusezap.serve.engine import LLMEngine, SamplingParams
+  from fusezap.serve.weights import STArray
+  monkeypatch.setenv("FZ_NEURON_PREFILL_SIZES", "32")
+  monkeypatch.setenv("FZ_NEURON_PREFILL_CTX", "32,64")
+  seen = []
+  orig = NK.upload
+  monkeypatch.setattr(NK, "upload", lambda a, device, dtype: seen.append((a.shape, dtype)) or orig(a, device, dtype))
+  out, toks, names = {}, {}, {}
+  for flag in ("0", "1"):
+    monkeypatch.setenv("FZ_NEURON_EMBED_DEV", flag)
+    m, _ = _model(tmp_path, seed=16, layers=1)
+    tb = f32_to_bf16(np.asarray(m.embed_host, np.float32)).view(STArray)   # a real checkpoint's bf16 table
+    tb.st_dtype = "BF16"
+    m.embed_host = tb
+    assert NK.embed_bf16(m) and NK.embed_dev(m) == (flag == "1")
+    e = LLMEngine(m, num_blocks=8, block_size=16, max_num_seqs=2, max_prefill_tokens=64, decode_beam=0)
+    assert e.embed_dev == (flag == "1")
+    seen.clear()
+    out[flag] = S6.prefill_bench(e, 1)
+    big = [s for s, dt in seen if dt == dtypes.bfloat16 and len(s) == 2 and s[0] > 1]   # (N, D) token rows uploaded
+    assert bool(big) == (flag == "0") and any(dt == dtypes.int32 and s[0] == 1 for s, dt in seen) == (flag == "1"), seen
+    rids = [e.add_request(list(np.random.default_rng(i).integers(0, 199, n)), SamplingParams(max_tokens=6)) for i, n in ((1, 20), (2, 45))]
+    while e.has_unfinished(): e.step()
+    toks[flag] = [list(e.seqs[r].output) for r in rids]
+    names[flag] = set()
+    for f in e._prefills.values():
+      for j in [f.jit, *f.ctx_jits.values()]:
+        for it in (j.captured.items if j.captured is not None else []):
+          sp = getattr(it.si.ast[0], "spec", None) if it.si.ast else None
+          if sp is not None: names[flag] |= {p[0] for p in sp.parts} if hasattr(sp, "parts") else {sp.name}
+  assert out["0"].keys() == out["1"].keys() and out["0"]
+  for k in out["0"]: assert out["0"][k]["logits_sha"] == out["1"][k]["logits_sha"], k
+  assert toks["0"] == toks["1"], toks
+  assert any(n.startswith("fz_embgather_32_") for n in names["1"]) and not any(n.startswith("fz_embgather") for n in names["0"]), names
+  # the check failing (a gather that returns the wrong rows): off, uploads as before
+  monkeypatch.setenv("FZ_NEURON_EMBED_DEV", "1")
+  monkeypatch.setattr(K, "embed_offsets", lambda ids, D: (np.asarray(ids, np.int64).reshape(1, -1) * D + 1).astype(np.int32))
+  m, _ = _model(tmp_path, seed=16, layers=1)
+  tb = f32_to_bf16(np.asarray(m.embed_host, np.float32)).view(STArray); tb.st_dtype = "BF16"; m.embed_host = tb
+  e = LLMEngine(m, num_blocks=8, block_size=16, max_num_seqs=2, max_prefill_tokens=64, decode_beam=0)
+  assert not e.embed_dev and e.embed_bf16

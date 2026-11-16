@@ -14,6 +14,7 @@ first, qᵀ / oᵀ on chip, the first key block without the rescale; bitwise by 
 weight-stationary; bitwise only if TensorE's float32 matmul is operand-symmetric): v2e, v2se, v2sw, v2swe. N8 (I70, --dtype
 bf16): "<v>+w<cols>[p<blocks>][q]" streams the bf16 weights in <cols>-column tiles, prefetching <blocks> gate_up blocks during
 attention (and with q every qkv / o_proj tile early): nki_bf16_n8.LayerBF16W, bitwise by construction (e.g. v2se+w2048p2q).
+W15: with --dtype f32, "<v>+w<cols>" is the float32 layer on <cols>-column weight tiles (FZ_NEURON_F32_WN, nki_f32w.LayerF32W).
 "bitwise_by_construction" in each record says which (nki_kernels.LAYER_BITWISE); the job's choice needs the measured bits. --variants takes "v2@512" to run a
 variant at that ctx only. --ablate: at the first (rows, ctx) also each v1 member alone (a FusedSpec of that part only, on
 the same buffers): the measured per-member breakdown. Writes <out>/layer_bench.json and one line per (rows, ctx, variant):
@@ -48,18 +49,21 @@ def qwen_shaped(dev: str, rows: int, ctx: int, layers: int = 3, hidden: int = 89
   return Llama(LlamaConfig.from_hf(c), ws, dtypes.float32, dev, max_len=ctx // rows, prefill_chunk=16, max_batch=rows)
 
 def set_variant(v: str) -> None:
-  """A LAYER_VARIANTS name, optionally "+w<cols>[p<blocks>][q]" (N8, bf16 only: FZ_NEURON_BF16_WN / _PF / _PFQO=1)."""
+  """A LAYER_VARIANTS name, optionally "+w<cols>[p<blocks>][q]" (N8, bf16: FZ_NEURON_BF16_WN / _PF / _PFQO=1; W15, float32:
+  "+w<cols>" sets FZ_NEURON_F32_WN, nki_f32w.LayerF32W; p / q are bf16 only)."""
   import re
   from fusezap.codegen.nki_kernels import LAYER_ENV, LAYER_VARIANTS
   from fusezap.codegen.nki_bf16_n8 import N8_ENV
+  from fusezap.codegen.nki_f32w import F32_ENV
   v, _, n8 = v.partition("+")
-  for k in LAYER_ENV + tuple(e for e in N8_ENV if "HEAD" not in e): os.environ.pop(k, None)
+  for k in LAYER_ENV + F32_ENV + tuple(e for e in N8_ENV if "HEAD" not in e): os.environ.pop(k, None)
   os.environ.update(LAYER_VARIANTS[v])
   os.environ["FZ_NEURON_BF16_WN"] = "512"   # N8 default is 4096 (nki_bf16_n8.WN_DEFAULT): a variant without +w is I68's layer
   if n8:
     m = re.fullmatch(r"w(\d+)(?:p(\d+))?(q?)", n8)
     assert m, f"variant suffix +{n8}: w<cols>[p<blocks>][q]"
-    os.environ.update({"FZ_NEURON_BF16_WN": m.group(1), "FZ_NEURON_BF16_PF": m.group(2) or "0", "FZ_NEURON_BF16_PFQO": "1" if m.group(3) else "0"})
+    os.environ.update({"FZ_NEURON_BF16_WN": m.group(1), "FZ_NEURON_BF16_PF": m.group(2) or "0", "FZ_NEURON_BF16_PFQO": "1" if m.group(3) else "0",
+                       "FZ_NEURON_F32_WN": m.group(1)})
 
 def steps(m, rows: int, n: int) -> list[np.ndarray]:
   """A fresh NeuronSteps (zeroed pool), then n greedy decode steps from position 0 (no prefill: only the decode forward's

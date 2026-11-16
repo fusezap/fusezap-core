@@ -98,6 +98,7 @@ def engine_process(a: argparse.Namespace) -> bool:
 
 def serve(a: argparse.Namespace) -> int:
   import uvicorn
+  from fusezap.serve import hostpath as HP
   from fusezap.serve.api import create_app, warmup, ProcEngine
   if engine_process(a):   # the engine process loads, warms up and prints as below
     from fusezap.serve.tokenizer import Tokenizer
@@ -105,7 +106,9 @@ def serve(a: argparse.Namespace) -> int:
     eng = ProcEngine(a, on_dead=lambda: [setattr(s, "should_exit", True) for s in box])
     eng.start()
     server = uvicorn.Server(uvicorn.Config(create_app(eng, Tokenizer.from_pretrained(a.model), a.served_model_name or a.model, a.api_key),
-                                           host=a.host, port=a.port, log_level=a.log_level))
+                                           host=a.host, port=a.port, log_level=a.log_level, **HP.uvicorn_opts()))
+    print(f"fusezap: {HP.describe()}", flush=True)
+    HP.gc_settle()   # the server process (the engine process settles its own after warm-up)
     box.append(server)
     if eng.dead: server.should_exit = True   # died before box held the server
     server.run()
@@ -118,7 +121,10 @@ def serve(a: argparse.Namespace) -> int:
     print(f"fusezap: warm-up {time.perf_counter() - t0:.1f}s (first run on a cold ~/.cache/fusezap also tunes kernels: minutes)", flush=True)
   from fusezap.serve.api import _print_memory
   _print_memory(eng)
-  try: uvicorn.run(create_app(eng, tok, a.served_model_name or a.model, a.api_key), host=a.host, port=a.port, log_level=a.log_level)
+  print(f"fusezap: {HP.describe()}", flush=True)
+  app = create_app(eng, tok, a.served_model_name or a.model, a.api_key)
+  HP.gc_settle(getattr(eng, "tp", None))
+  try: uvicorn.run(app, host=a.host, port=a.port, log_level=a.log_level, **HP.uvicorn_opts())
   finally:
     from fusezap.serve.api import close_tp
     close_tp(eng)

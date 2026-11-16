@@ -276,7 +276,8 @@ def test_tp_step_random_stamps_dry_run(tmp_path):
   script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bench", "tp_step.py")
   p = subprocess.run([sys.executable, script, "--random", "tiny", "--layers", "1", "--device", "METAL", "--dtype", "float32", "--modes", "nccl",
                       "--env-ab", "st:mode=nccl,FZ_TP_AR_STAMP=1", "--buckets", "1,2", "--steps", "4", "--ctx", "16", "--max-model-len", "128",
-                      "--num-blocks", "64", "--breakdown", "", "--ar-rows", "1", "--ar-chain", "both", "--prefix", "x_", "--json", str(out)],
+                      "--num-blocks", "64", "--breakdown", "", "--ar-rows", "1", "--ar-chain", "both", "--prefix", "x_", "--json", str(out),
+                      "--ttft-ctx", "8,16", "--prefill-breakdown", "16"],
                      capture_output=True, text=True, timeout=600, env={**os.environ, "FZ_DEVICE": "METAL"})
   assert p.returncode == 0, p.stderr[-3000:]
   r = json.load(open(out))
@@ -285,3 +286,6 @@ def test_tp_step_random_stamps_dry_run(tmp_path):
   assert len(st) == 2 and all(x["ars"] == 2 and x["forwards"] >= 2 and x["intrinsic_ms"] > 0 for x in st), st
   assert {a["chain"] for a in r["ar"]} == {True, False} and r["info"]["random"] == "tiny"
   assert "all-reduce stamps" in p.stdout and "x_st" in p.stdout
+  # W15: TTFT per prompt length per mode; the prefill breakdown off CUDA reports an error per rank instead of failing
+  assert set(r["ttft_ctx"]["x_nccl"]) == {"8", "16"} and r["prefill_sizes"]
+  assert len(r["prefill_kernels"]) == 1 and all("error" in k or "classes" in k for k in r["prefill_kernels"][0])

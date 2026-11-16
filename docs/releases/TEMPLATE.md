@@ -2,8 +2,9 @@
 
 <!--
 Release note template. Copy to docs/releases/v{version}.md (or run `scripts/release.py draft {version}`).
-Every `## ` heading below is required: `scripts/release.py check` fails a tag whose note is missing one, and fails
-when "Breaking changes" is empty. HTML comments do not count as content. Write "None." where a section has nothing.
+Every `## ` heading below is required and must have content: `scripts/release.py check` fails a tag whose note is
+missing one or leaves one empty. HTML comments do not count as content. Write "None." where a section has nothing.
+{date} and {line_date} may stay as they are: `cut` fills them with the build date.
 Policy: docs/releases/README.md. Customer-facing language; no customer names, no prices.
 -->
 
@@ -63,4 +64,9 @@ Then what happened to the previous note's "Next" items: shipped, slipped (and wh
 
 ## Checksums
 
-<!-- sha256 of every published artifact (wheel, sdist), e.g. `shasum -a 256 dist/*`. -->
+<!-- This note is committed (and tagged) before the artifacts are built, so the sums are published beside them:
+`scripts/release.py checksums {version} dist/` checks the built wheel and sdist (version, no Invarix or key material)
+and writes dist/SHA256SUMS; attach both to the GitHub release. Keep the sentence below. -->
+
+The wheel and sdist are attached to the GitHub release together with `SHA256SUMS`; check a download with
+`shasum -a 256 -c SHA256SUMS`.

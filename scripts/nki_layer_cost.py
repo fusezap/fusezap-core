@@ -266,7 +266,8 @@ def layer_sizes(sp) -> list[int]:
 
 def layer_spec(rows: int, ctx: int, variant: str, base: int = 64):
   """LayerSpec of a LAYER_VARIANTS name; "<v>+bf16" / "<v>+bf16a": nki_bf16.LayerBF16 of it (I68); "<v>+bf16+w<cols>[p<k>][q]":
-  nki_bf16_n8.LayerBF16W of that (N8: FZ_NEURON_BF16_WN=<cols>, _PF=<k>, _PFQO=1; e.g. v2se+bf16+w2048, v2se+bf16+w512p2)."""
+  nki_bf16_n8.LayerBF16W of that (N8: FZ_NEURON_BF16_WN=<cols>, _PF=<k>, _PFQO=1; e.g. v2se+bf16+w2048, v2se+bf16+w512p2);
+  "<v>+w<cols>": nki_f32w.LayerF32W, float32 weights on <cols>-column tiles (W15: FZ_NEURON_F32_WN; e.g. v2se+w4096)."""
   from fusezap.codegen import nki_kernels as nk
   variant, _, dt = variant.partition("+")
   dt, _, n8 = dt.partition("+")
@@ -276,6 +277,10 @@ def layer_spec(rows: int, ctx: int, variant: str, base: int = 64):
                       e["FZ_NEURON_LAYER_ROPE"], e["FZ_NEURON_LAYER_MM"], e["FZ_NEURON_LAYER_EARLY"] == "1", int(e["FZ_NEURON_LAYER_PF"]),
                       tile=e.get("FZ_NEURON_LAYER_TILE") == "1", wcols=int(e.get("FZ_NEURON_LAYER_WCOLS") or nk.LAYER_WCOLS))
   if not dt: return sp
+  if dt.startswith("w"):   # W15: "<v>+w<cols>": the float32 layer on <cols>-column weight tiles (nki_f32w.LayerF32W)
+    from fusezap.codegen.nki_f32w import LayerF32W
+    assert re.fullmatch(r"w\d+", dt), f"variant suffix +{dt}: float32 takes w<cols> only"
+    return LayerF32W(sp, int(dt[1:]))
   from fusezap.codegen.nki_bf16 import LayerBF16
   assert dt in ("bf16", "bf16a"), f"variant suffix +{dt}: +bf16 or +bf16a"
   sp = LayerBF16(sp, dt == "bf16a")

@@ -4,16 +4,20 @@
   python scripts/release.py check v0.2.0            # everything a tag needs (CI runs this on the tag)
   python scripts/release.py check v0.2.0 --pre-tag  # the same without the tag checks (before cutting, in PRs)
   python scripts/release.py draft 0.2.0             # docs/releases/v0.2.0.md from TEMPLATE.md + the live matrix
+                                                    # ({date} / {line_date} stay for cut to fill unless --date)
   python scripts/release.py cut 0.2.0 --dry-run     # show what cut would change, write nothing
   python scripts/release.py cut 0.2.0               # bump, move Unreleased, freeze matrix, index entry, commit,
                                                     # release/0.2 branch (first cut on a line), annotated tag;
                                                     # prints the push commands instead of running them
+  python scripts/release.py checksums 0.2.0 dist/   # check the built wheel + sdist (version, no Invarix / key
+                                                    # material), write dist/SHA256SUMS for the GitHub release
 
 `check vX.Y.Z` fails unless:
   - pyproject.toml, fusezap/_version.py (fusezap.__version__) and the tag agree on X.Y.Z (pyproject reads the version
     from _version.py through [tool.hatch.version]; a static `version` in pyproject must equal it),
-  - docs/releases/vX.Y.Z.md exists, has every `## ` heading of docs/releases/TEMPLATE.md, no unfilled {placeholder},
-    and "Breaking changes" is non-empty ("None." when nothing breaks; a patch release must say None),
+  - docs/releases/vX.Y.Z.md exists, has every `## ` heading of docs/releases/TEMPLATE.md, each with content ("None."
+    when a section has nothing: Fixes, Known issues and What's next are never silently empty), no unfilled
+    {placeholder}, and a patch release's "Breaking changes" says None,
   - CHANGELOG.md has a non-empty `## [X.Y.Z] - YYYY-MM-DD` section whose date is the index entry's date,
   - docs/releases/index.yaml has a well-formed entry for X.Y.Z,
   - docs/releases/matrix/vX.Y.Z.yaml parses and every cell follows the status rules, every Supported cell with
@@ -264,8 +268,9 @@ def check(repo: Repo, version: str, pre_tag: bool = False) -> list[str]:
       secs = note_sections(note)
       for h in template_headings(repo):
         if h not in secs: errs.append(f"{v.note}: missing section '## {h}'")
+      for h in template_headings(repo):
+        if h in secs and not secs[h]: errs.append(f"{v.note}: '{h}' is empty (write 'None.' if there is nothing)")
       bc = secs.get("Breaking changes")
-      if bc is not None and not bc: errs.append(f"{v.note}: 'Breaking changes' is empty (write 'None.' if nothing breaks)")
       if bc and v.patch > 0 and not re.match(r"(?i)none\b", bc):
         errs.append(f"{v.note}: a patch release has no breaking changes; 'Breaking changes' must say None")
       ph = sorted(set(_PLACEHOLDER.findall(_COMMENT.sub("", note))))
@@ -324,15 +329,26 @@ def check(repo: Repo, version: str, pre_tag: bool = False) -> list[str]:
 # ---------------------------------------------------------------- draft
 
 
-def draft_text(repo: Repo, v: Version, date: str, line_date: str) -> str:
+def draft_text(repo: Repo, v: Version, date: str | None, line_date: str | None) -> str:
+  """The template filled for v and the live matrix pasted in. date / line_date None: their {date} / {line_date}
+  placeholders stay for `cut` to fill with the real build date (fill_dates)."""
   t = repo.read(TEMPLATE)
   matrix_md = RM.to_markdown(RM.load(SOURCES, repo.root, text=repo.read(SOURCES)))
-  t = (t.replace("{version}", str(v)).replace("{invarix_version}", str(v)).replace("{line_date}", line_date)
-       .replace("{date}", date).replace("{line}", v.line))
+  t = t.replace("{version}", str(v)).replace("{invarix_version}", str(v)).replace("{line}", v.line)
+  if line_date: t = t.replace("{line_date}", line_date)
+  if date: t = t.replace("{date}", date)
   return re.sub(r"(?m)^(## Support matrix\s*\n)", lambda m: m.group(1) + "\n" + matrix_md, t, count=1)
 
 
 # ---------------------------------------------------------------- cut
+
+
+def fill_dates(text: str, date: str, line_date: str, invarix_version: str) -> str:
+  """A drafted note's {date} / {line_date} / {invarix_version}, outside HTML comments, as `cut` knows them."""
+  parts = re.split(r"(<!--.*?-->)", text, flags=re.S)
+  for i in range(0, len(parts), 2):
+    parts[i] = parts[i].replace("{date}", date).replace("{line_date}", line_date).replace("{invarix_version}", invarix_version)
+  return "".join(parts)
 
 
 def _today() -> str: return dt.date.today().isoformat()
@@ -374,6 +390,8 @@ def plan_cut(repo: Repo, v: Version, date: str, invarix_version: str | None = No
     invarix_version = str(prev[-1]["products"]["invarix"]) if v.patch > 0 and prev else str(v)
   invarix_v = str(Version.parse(invarix_version))
   if Version.parse(invarix_v).line != v.line: raise ReleaseError(f"Invarix {invarix_v} is not on line {v.line}")
+  note = repo.read(v.note)
+  if _PLACEHOLDER.search(_COMMENT.sub("", note)): files[v.note] = fill_dates(note, date, line_date, invarix_v)
   entry = {"version": str(v), "date": date, "line": v.line, "line_date": line_date, "support": "current",
            "invarix_maintenance_needed": line_date, "products": {"core": str(v), "invarix": invarix_v},
            "notes": v.note, "matrix": v.matrix}
@@ -440,6 +458,61 @@ def cut(repo: Repo, version: str, dry_run: bool = False, date: str | None = None
   return 0
 
 
+# ---------------------------------------------------------------- artifacts
+
+
+FORBIDDEN_IN_ARTIFACT = re.compile(r"(^|/)fusezap/invarix(/|$)|(^|/)_keys\.py$|\.pem$|\.key$|\.lic$|(^|/)licence_dev\.py$")
+
+
+def artifact_names(path: Path) -> list[str]:
+  """The member paths of a wheel (zip) or sdist (tar.gz); an sdist's top directory is dropped."""
+  import tarfile, zipfile
+  if path.suffix == ".whl":
+    with zipfile.ZipFile(path) as z: return z.namelist()
+  with tarfile.open(path) as t: return [n.split("/", 1)[1] if "/" in n else n for n in t.getnames()]
+
+
+def artifact_read(path: Path, name: str) -> str | None:
+  import tarfile, zipfile
+  if path.suffix == ".whl":
+    with zipfile.ZipFile(path) as z: return z.read(name).decode() if name in z.namelist() else None
+  with tarfile.open(path) as t:
+    m = next((m for m in t.getmembers() if m.name.split("/", 1)[-1] == name), None)
+    return t.extractfile(m).read().decode() if m is not None and m.isfile() else None
+
+
+def checksums(version: str, dist: str | Path, write: bool = True) -> tuple[list[str], list[str]]:
+  """(SHA256SUMS lines, problems) for the release artifacts in dist: exactly one fusezap wheel and one sdist of this
+  version, each saying that version (_version.py; the wheel's METADATA), neither holding FuseZap Invarix or key /
+  licence material, and no fusezap artifact of another version beside them. Writes dist/SHA256SUMS (`shasum -a 256 -c
+  SHA256SUMS` checks it) when there is no problem and write is set."""
+  import hashlib
+  v = Version.parse(version)
+  d = Path(dist)
+  if not d.is_dir(): return [], [f"{d} is not a directory"]
+  arts = sorted(p for p in d.iterdir() if p.name.startswith("fusezap-") and (p.suffix == ".whl" or p.name.endswith(".tar.gz")))
+  wheels = [p for p in arts if p.suffix == ".whl" and p.name.startswith(f"fusezap-{v}-")]
+  sdists = [p for p in arts if p.name == f"fusezap-{v}.tar.gz"]
+  errs = [f"{p.name}: not a {v} artifact" for p in arts if p not in wheels + sdists]
+  if len(wheels) != 1: errs.append(f"{d}: expected one fusezap-{v}-*.whl, found {len(wheels)}")
+  if len(sdists) != 1: errs.append(f"{d}: expected fusezap-{v}.tar.gz, found {len(sdists)}")
+  for p in wheels + sdists:
+    try: names = artifact_names(p)
+    except Exception as e: errs.append(f"{p.name}: cannot read: {e}"); continue
+    bad = [n for n in names if FORBIDDEN_IN_ARTIFACT.search(n)]
+    if bad: errs.append(f"{p.name}: holds {', '.join(bad[:3])}{' ...' if len(bad) > 3 else ''} (Invarix or key material)")
+    m = _VERSION_LINE.search(artifact_read(p, VERSION_FILE) or "")
+    if not m or m.group(1) != str(v): errs.append(f"{p.name}: {VERSION_FILE} says {m.group(1) if m else '?'}, expected {v}")
+    if p.suffix == ".whl":
+      meta = next((n for n in names if n.endswith(".dist-info/METADATA")), None)
+      mv = re.search(r"(?m)^Version: (\S+)", artifact_read(p, meta) or "") if meta else None
+      if not mv or mv.group(1) != str(v): errs.append(f"{p.name}: METADATA Version is {mv.group(1) if mv else '?'}, expected {v}")
+  if errs: return [], errs
+  lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}" for p in wheels + sdists]
+  if write: (d / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+  return lines, []
+
+
 # ---------------------------------------------------------------- CLI
 
 
@@ -452,7 +525,7 @@ def main(argv=None) -> int:
   c.add_argument("--pre-tag", action="store_true", help="skip the tag checks (before cut, in PRs)")
   d = sub.add_parser("draft", help="write docs/releases/vX.Y.Z.md from the template and the live matrix")
   d.add_argument("version")
-  d.add_argument("--date", help="release date (default today)")
+  d.add_argument("--date", help="release date (default: left as {date} for cut to fill)")
   k = sub.add_parser("cut", help="cut a release locally: bump, changelog, matrix, index, commit, branch, tag")
   k.add_argument("version")
   k.add_argument("--dry-run", action="store_true", help="print what would change; write nothing")
@@ -460,6 +533,9 @@ def main(argv=None) -> int:
   k.add_argument("--remote", default="origin", help="remote named in the printed push commands")
   k.add_argument("--invarix-version", help="Invarix version on this release (default: X.Y.Z for a minor, "
                  "the line's current Invarix version for a Core patch)")
+  s = sub.add_parser("checksums", help="check the built wheel + sdist of X.Y.Z and write SHA256SUMS next to them")
+  s.add_argument("version")
+  s.add_argument("dist", nargs="?", default="dist", help="directory holding the built artifacts (default dist)")
   a = ap.parse_args(argv)
   repo = Repo(a.repo)
   try:
@@ -472,14 +548,20 @@ def main(argv=None) -> int:
     if a.cmd == "draft":
       v = Version.parse(a.version)
       if repo.exists(v.note): raise ReleaseError(f"{v.note} already exists")
-      date = a.date or _today()
-      line_date = date
+      date = line_date = a.date
       if v.patch > 0:
         base = next((r for r in load_index(repo)[1] if str(r.get("version")) == f"{v.line}.0"), None)
         line_date = str(base["line_date"]) if base else date
       p = repo.root / v.note
       p.write_text(draft_text(repo, v, date, line_date))
       print(f"release: wrote {v.note}; fill in every section, then `scripts/release.py cut {v} --dry-run`")
+      return 0
+    if a.cmd == "checksums":
+      lines, errs = checksums(a.version, a.dist if Path(a.dist).is_absolute() else Path.cwd() / a.dist)
+      for e in errs: print(f"release: {e}", file=sys.stderr)
+      if errs: return 1
+      print("\n".join(lines))
+      print(f"release: wrote {Path(a.dist) / 'SHA256SUMS'}; attach it to the GitHub release with the artifacts")
       return 0
     if a.cmd == "cut": return cut(repo, a.version, dry_run=a.dry_run, date=a.date, remote=a.remote,
                                   invarix_version=a.invarix_version)

@@ -80,6 +80,48 @@ def pfk_wn() -> int:
   if w % TN or not TN <= w <= 8 * TN: raise ValueError(f"FZ_NEURON_PFK_WN={w}: a multiple of {TN} in [{TN}, {8 * TN}]")
   return w
 
+# I69 (first token): the exact exp's VectorE work in fewer, wider instructions. VectorE pays a fixed ~0.14 us per instruction
+# (scripts/nki_layer_cost.py's fit) besides ~0.74 ns per element, and PFAttn ran nki.exact_exp's ~35 instructions per q head
+# and key block on (rows, 128) and (rows, 1) tiles at a 128-slot prefix: the fixed part was most of attention's VectorE time.
+# Every switch below keeps each element's instruction sequence (same ops, same order, same immediates), so the bits stay the
+# members' (tests/test_nki_prefill.py checks them on NKISHIM); the old kernels are FZ_NEURON_PFK_ATTN_HB=0, FZ_NEURON_PFK_SILU=512,
+# FZ_NEURON_PFK_EXPF=0 (their source is then main's, byte for byte).
+
+def pfk_attn_hb() -> int:
+  """FZ_NEURON_PFK_ATTN_HB (default 2048; 0 = one q head at a time, main's PFAttn): PFAttn's softmax exps (and its per-row
+  max / sum bookkeeping) for a group of q heads at once, in tiles of up to this many elements per partition (heads per group =
+  this // key block width, at least 1)."""
+  v = _env_int("FZ_NEURON_PFK_ATTN_HB", 2048)
+  if v < 0: raise ValueError(f"FZ_NEURON_PFK_ATTN_HB={v}: 0 (per head) or elements per partition")
+  return v
+
+def pfk_silu() -> int:
+  """FZ_NEURON_PFK_SILU (default 512, main's PFMLP; 2048: one silu(gate) * up chain over the gate / up block, a multiple of
+  512 capped by the block). Off by default: I69's inf2 run measured the wide chain slower (layer 1.457 ms vs main's 1.408
+  at 128 rows / 128 slots), though the model put it faster."""
+  v = _env_int("FZ_NEURON_PFK_SILU", 512)
+  if v % TN or v <= 0: raise ValueError(f"FZ_NEURON_PFK_SILU={v}: a positive multiple of {TN}")
+  return v
+
+def pfk_expf() -> bool:
+  """FZ_NEURON_PFK_EXPF (default 1; 0 = main's): nki.exact_exp's fused form in the prefill kernels (the clamp in one
+  instruction, each power's exponent bits in one; exact either way: nki.exact_exp's docstring)."""
+  v = (os.environ.get("FZ_NEURON_PFK_EXPF", "") or "1").strip()
+  if v not in ("0", "1"): raise ValueError(f"FZ_NEURON_PFK_EXPF={v!r}: 0 or 1")
+  return v == "1"
+
+# the switches by short name (scripts/nki_prefill_cost.py and scripts/nki_pfk_bench.py paths "v2exact+hb+silu", the job's variants):
+# (env, on, main's value)
+I69_FLAGS = {"hb": ("FZ_NEURON_PFK_ATTN_HB", "2048", "0"), "silu": ("FZ_NEURON_PFK_SILU", "2048", "512"), "xf": ("FZ_NEURON_PFK_EXPF", "1", "0")}
+
+def i69_env(flags) -> dict:
+  """The env of a set of I69 flags (hb, silu, xf; `i69` = all three): each named flag on, every other one at main's value
+  (no flags: main's kernels)."""
+  flags = set(flags)
+  if "i69" in flags: flags = (flags - {"i69"}) | set(I69_FLAGS)
+  if bad := flags - set(I69_FLAGS): raise ValueError(f"unknown I69 flags {sorted(bad)}: {sorted(I69_FLAGS)} or i69")
+  return {k: (on if f in flags else off) for f, (k, on, off) in I69_FLAGS.items()}
+
 def block_cols(rows: int, banks: int, wn: int) -> int:
   """Columns per weight DMA for `rows` rows: every row block holds one PSUM bank per 512 columns of the block, so
   ceil(rows / 128) * cols / 512 <= banks (at least 512 columns), capped at wn."""
@@ -135,13 +177,34 @@ def _mm(L: list[str], ats: list[tuple[str, int]], K: int, w: str, ws: int, c_off
     for r, (at, Mr) in enumerate(ats):
       for j, s0, sw in subs: L += evict(r, f"ps{tag}_{r}_{j}", c0 + s0, sw)
 
-def _exp2(dsts: list[str], xs: list[str], shapes: list[str], ind: str, mode: str) -> list[str]:
+def _exp2(dsts: list[str], xs: list[str], shapes: list[str], ind: str, mode: str, fused: bool = False) -> list[str]:
   """dst = exp(x + ng) per (dst, x, shape): nki_kernels._exp (exact: VectorE, the members' bits) or (act) one ScalarE
-  activation each with ng as its bias."""
+  activation each with ng as its bias. fused: nki.exact_exp's fused form (the same bits, I69)."""
   if mode == "act": return [f"{ind}nisa.activation(dst={d}, op=nl.exp, data={x}, bias=ng, scale=1.0)" for d, x in zip(dsts, xs)]
-  from fusezap.codegen.nki_kernels import _exp
   if not nki.EXACT: raise NKIUnsupported("prefill kernels: FZ_NKI_FAST_EXP is the global switch; use FZ_NEURON_PFK_EXP=act")
-  return _exp(dsts, xs, shapes, ind)
+  if not fused:
+    from fusezap.codegen.nki_kernels import _exp
+    return _exp(dsts, xs, shapes, ind)
+  out: list[str] = []
+  for j, (d, x, shape) in enumerate(zip(dsts, xs, shapes)):   # nki_kernels._exp with the fused exact_exp
+    out += _exact_exp_lines(d, x, shape, ind, f"ex{j}_", add="ng")
+  return out
+
+def _exact_exp_lines(d: str, x: str, shape: str, ind: str, prefix: str, add: str | None = None, fused: bool = True) -> list[str]:
+  """d = exp(x [+ add]) on VectorE: nki_kernels._exp's lines (the add first, its tensor_scalar with a per-row operand, then
+  nki.exact_exp in base e) on fresh tiles of `shape` named <prefix><k>."""
+  out: list[str] = []
+  k = iter(range(10 ** 6))
+  def new(dt) -> str:
+    name = f"{prefix}{next(k)}"
+    if dt is not None: out.append(f"{ind}{name} = nl.ndarray({shape}, dtype=nl.{nki.nl_dtype(dt)}, buffer=nl.sbuf)")
+    return name
+  xb = x
+  if add is not None:
+    xb = new(dtypes.float32)
+    out.append(f"{ind}nisa.tensor_scalar(dst={xb}, data={x}, op0=nl.add, operand0={add})")
+  nki.exact_exp(lambda ln: out.append(ind + ln), new, d, xb, base2=False, fused=fused)
+  return out
 
 def _silu_act(T: str, g: str, u: str, dst: str, ind: str) -> list[str]:
   """dst = silu(g) * u with g * 1 / (1 + exp(-g)): the exp on ScalarE (FZ_NEURON_PFK_EXP=act; not the renderer's bits)."""
@@ -158,6 +221,44 @@ def _program(name: str, args: tuple[str, ...], L: list[str], outs: tuple[int, ..
   body = [f"def {name}({', '.join(A.values())}):", src, f"  return {', '.join(f'data{i}' for i in outs)}"]
   dts = {i: dtypes.bfloat16 if nm in bf16 else dtypes.int32 if nm in ints else dtypes.float32 for i, nm in enumerate(args)}
   return NKIProgram(name, HEADER + "\n".join(body) + "\n", len(args), outs, dts)
+
+# ---------------------------------------------------------------- EmbedGather: the prefill's token rows on the device (I69)
+
+@dataclass(frozen=True)
+class EmbedGather:
+  """X (N, D) float32 = the rows of a bf16 table (V, D) at the token ids, widened exactly (FZ_NEURON_EMBED_DEV=1: the
+  prefill's token rows come from a device copy of the embedding table instead of a 0.9 MB bf16 upload per step).
+  `fz_embgather_N_V_D(data0=X, data1=OFF (1, N) int32 = id * D, the host's exact element offsets, data2=T (V, D) bf16)`.
+  Per row block of <= 128 tokens: the offsets into SBUF by one DMA, each token's row by one DMA whose source offset is
+  its (1, 1) int32 value (nki 0.6 `ap(..., scalar_offset=)`, the indirect form chip-validated by I105 A2's MoE kernels:
+  FZ_MOE_IDMA=scalar) into partition n of a (rows, D) bf16 tile, one tensor_copy to float32 (exact: every bf16 is a
+  float32), one DMA out. Values: the host path's (embed_host[ids] uploaded as bf16, widened by the forward's cast) bit for
+  bit; padding rows carry id 0 on both paths."""
+  N: int
+  V: int
+  D: int
+  @property
+  def name(self) -> str: return f"fz_embgather_{self.N}_{self.V}_{self.D}"
+  def args(self) -> tuple[str, ...]: return ("x", "off", "t")
+  def render(self) -> NKIProgram:
+    N, V, D = self.N, self.V, self.D
+    if min(N, V, D) <= 0 or (V - 1) * D >= 2 ** 31: raise NKIUnsupported(f"{self.name}: offsets past int32")
+    if 2 * D + 4 * D > 160 * 1024: raise NKIUnsupported(f"{self.name}: a row of {D} does not fit a partition")
+    L: list[str] = []
+    for r, (t0, Mr) in enumerate(_rblocks(N)):
+      L += [_sb(f"of{r}", (1, Mr), "int32"), f"  nisa.dma_copy(dst=of{r}, src=@off@.ap(pattern=[[{N}, 1], [1, {Mr}]], offset={t0}))",
+            _sb(f"tb{r}", (Mr, D), "bfloat16"),
+            f"  for n in range({Mr}):",
+            f"    nisa.dma_copy(dst=tb{r}[n:n + 1, 0:{D}], src=@t@.ap(pattern=[[{D}, 1], [1, {D}]], offset=0, scalar_offset=of{r}[0:1, n:n + 1]))",
+            _sb(f"tf{r}", (Mr, D)), f"  nisa.tensor_copy(dst=tf{r}, src=tb{r})",
+            f"  nisa.dma_copy(dst={_rows('@x@', t0, Mr, D)}, src=tf{r})"]
+    return _program(self.name, self.args(), L, (0,), bf16=("t",), ints=("off",))
+  def sizes(self) -> list[int]: return [self.N * self.D, self.N, self.V * self.D]
+
+def embed_offsets(ids, D: int):
+  """EmbedGather's OFF argument: (1, N) int32 element offsets id * D (exact integers; ids in [0, V))."""
+  import numpy as np
+  return (np.asarray(ids, np.int64).reshape(1, -1) * int(D)).astype(np.int32)
 
 # ---------------------------------------------------------------- PFLinear: o_proj, lm_head
 
@@ -295,9 +396,82 @@ class PFAttn:
   scale: float
   base: int
   exp: str = "exact"
+  hb: int = 0          # I69: FZ_NEURON_PFK_ATTN_HB (0: one q head at a time)
+  expf: bool = False   # I69: FZ_NEURON_PFK_EXPF (nki.exact_exp's fused form)
   @property
-  def name(self) -> str: return f"fz_pfattn_{self.N}_{self.Hq}_{self.Hkv}_{self.hd}_{self.P}" + ("_act" if self.exp == "act" else "")
+  def heads_per_group(self) -> int:
+    """q heads whose softmax exps run as one (exact exp only; 0: per head, main's kernel): hb // the widest key block."""
+    if not self.hb or self.exp != "exact": return 0
+    return max(1, min(self.Hq, self.hb // min(TS, self.P)))
+  @property
+  def name(self) -> str:
+    return f"fz_pfattn_{self.N}_{self.Hq}_{self.Hkv}_{self.hd}_{self.P}" + ("_act" if self.exp == "act" else "") + \
+           (f"_hb{self.heads_per_group}" if self.heads_per_group else "") + ("_xf" if self.expf and self.exp == "exact" else "")
   def args(self) -> tuple[str, ...]: return ("os", "xs", "pool", "meta")
+  def _heads_batched(self, L: list[str], t0: int, lt: int, blocks: list) -> None:
+    """Rows t0 .. t0+lt-1 (lo / hi and the key blocks' masks mk<b> already in SBUF), I69: the q heads in groups of
+    heads_per_group. Per element the per-head kernel's instructions in its order (render_attention's key block), only on
+    wider tiles: per head the scores, their scale and mask, the row max, the exp arguments (x + ng, its tensor_scalar with the
+    per-row operand) into a slice of a group tile, then ONE exact exp for the group's alphas and ONE for its probabilities,
+    the row sums per head, the running max / sum updates on (rows, heads) tiles, acc and the PV matmuls per head. q comes in
+    and o goes out by one DMA per group (the group's heads are adjacent columns)."""
+    N, Hq, Hkv, hd = self.N, self.Hq, self.Hkv, self.hd
+    G, C = Hq // Hkv, Hkv * hd
+    C2, Ho, Wx = 2 * C, Hq * hd, (Hq + 2 * Hkv + 1) * hd
+    gh = self.heads_per_group
+    for g0 in range(0, Hq, gh):
+      hs = list(range(g0, min(Hq, g0 + gh)))
+      ng_ = len(hs)
+      L += [f"  # q heads {hs[0]} .. {hs[-1]} (I69: one exact exp per group and key block)",
+            _sb("qg", (lt, ng_ * hd)), f"  nisa.dma_copy(dst=qg, src={_rows('@xs@', t0, lt, Wx, g0 * hd, ng_ * hd)})"]
+      for j in range(ng_):
+        L += [f"  qp = nl.ndarray(({hd}, {lt}), dtype=nl.float32, buffer=nl.psum)", f"  nisa.nc_transpose(dst=qp, data=qg[:, {j * hd}:{(j + 1) * hd}])",
+              _sb(f"qt{j}", (hd, lt)), f"  nisa.tensor_copy(dst=qt{j}, src=qp)"]
+      L += [_sb("MR", (lt, ng_)), f"  nisa.memset(dst=MR, value={_fl(-FLT_MAX)})", _sb("LR", (lt, ng_)), "  nisa.memset(dst=LR, value=0.0)",
+            _sb("ACC", (lt, ng_ * hd)), "  nisa.memset(dst=ACC, value=0.0)"]
+      for b, s0, st in blocks:
+        W = ng_ * st
+        L += [_sb("SM", (lt, W)), "  nisa.memset(dst=SM, value=float('-inf'))", _sb("BM", (lt, ng_))]
+        for j, hq in enumerate(hs):
+          sl = f"SM[:, {j * st}:{(j + 1) * st}]"
+          L += [f"  ss = nl.ndarray(({lt}, {st}), dtype=nl.float32, buffer=nl.psum)",
+                f"  nisa.nc_matmul(dst=ss, stationary=qt{j}[0:{hd}, 0:{lt}], moving=kt{hq // G}[:, {s0}:{s0 + st}], accumulate=False)",
+                _sb("sc", (lt, st)), f"  nisa.tensor_scalar(dst=sc, data=ss, op0=nl.multiply, operand0={_fl(self.scale)})",
+                f"  nisa.tensor_copy_predicated(dst={sl}, src=sc, predicate=mk{b})",
+                f"  nisa.tensor_reduce(dst=BM[:, {j}:{j + 1}], op=nl.maximum, data={sl}, axis=1)"]
+        L += [_sb("MN", (lt, ng_)), "  nisa.tensor_tensor(dst=MN, data1=MR, data2=BM, op=nl.maximum)",
+              _sb("NG", (lt, ng_)), "  nisa.tensor_scalar(dst=NG, data=MN, op0=nl.multiply, operand0=-1.0)",
+              _sb("XA", (lt, ng_)), _sb("XB", (lt, W))]
+        for j in range(ng_):
+          L += [f"  nisa.tensor_scalar(dst=XA[:, {j}:{j + 1}], data=MR[:, {j}:{j + 1}], op0=nl.add, operand0=NG[:, {j}:{j + 1}])",
+                f"  nisa.tensor_scalar(dst=XB[:, {j * st}:{(j + 1) * st}], data=SM[:, {j * st}:{(j + 1) * st}], op0=nl.add, operand0=NG[:, {j}:{j + 1}])"]
+        L += [_sb("AL", (lt, ng_))] + _exact_exp_lines("AL", "XA", f"({lt}, {ng_})", "  ", "ea", fused=self.expf)
+        L += [_sb("PW", (lt, W))] + _exact_exp_lines("PW", "XB", f"({lt}, {W})", "  ", "ep", fused=self.expf)
+        L += [_sb("RS", (lt, ng_))]
+        L += [f"  nisa.tensor_reduce(dst=RS[:, {j}:{j + 1}], op=nl.add, data=PW[:, {j * st}:{(j + 1) * st}], axis=1)" for j in range(ng_)]
+        L += ["  nisa.tensor_tensor(dst=LR, data1=LR, data2=AL, op=nl.multiply)", "  nisa.tensor_tensor(dst=LR, data1=LR, data2=RS, op=nl.add)"]
+        L += [f"  nisa.tensor_scalar(dst=ACC[:, {j * hd}:{(j + 1) * hd}], data=ACC[:, {j * hd}:{(j + 1) * hd}], op0=nl.multiply, operand0=AL[:, {j}:{j + 1}])"
+              for j in range(ng_)]
+        L += ["  nisa.tensor_copy(dst=MR, src=MN)"]
+        for j, hq in enumerate(hs):
+          h = hq // G
+          for c0 in range(0, hd, TN):
+            cw = min(TN, hd - c0)
+            L += [f"  op = nl.ndarray(({lt}, {cw}), dtype=nl.float32, buffer=nl.psum)"]
+            for jj, k0 in enumerate(range(0, st, TK)):
+              ct, g = min(TK, st - k0), (s0 + k0) // TM
+              L += [f"  pp = nl.ndarray(({ct}, {lt}), dtype=nl.float32, buffer=nl.psum)",
+                    f"  nisa.nc_transpose(dst=pp, data=PW[:, {j * st + k0}:{j * st + k0 + ct}])",
+                    _sb("pt", (ct, lt)), "  nisa.tensor_copy(dst=pt, src=pp)",
+                    f"  nisa.nc_matmul(dst=op, stationary=pt, moving=pl[0:{ct}, {g * C2 + C + h * hd + c0}:{g * C2 + C + h * hd + c0 + cw}], "
+                    f"accumulate={jj > 0})"]
+            a = f"ACC[:, {j * hd + c0}:{j * hd + c0 + cw}]"
+            L += [f"  nisa.tensor_tensor(dst={a}, data1={a}, data2=op, op=nl.add)"]
+      L += [_sb("RL", (lt, ng_)), f"  nisa.tensor_scalar(dst=LR, data=LR, op0=nl.maximum, operand0={nki.FLT_MIN_!r})",
+            "  nisa.reciprocal(dst=RL, data=LR)"]
+      L += [f"  nisa.tensor_scalar(dst=ACC[:, {j * hd}:{(j + 1) * hd}], data=ACC[:, {j * hd}:{(j + 1) * hd}], op0=nl.multiply, operand0=RL[:, {j}:{j + 1}])"
+            for j in range(ng_)]
+      L += [f"  nisa.dma_copy(dst={_rows('@os@', t0, lt, Ho, g0 * hd, ng_ * hd)}, src=ACC)"]
   def render(self) -> NKIProgram:
     N, Hq, Hkv, hd, P = self.N, self.Hq, self.Hkv, self.hd, self.P
     if min(N, Hq, Hkv, hd, P) <= 0 or Hq % Hkv or hd > TK: raise NKIUnsupported(f"{self.name}: head_dim <= 128, Hq a multiple of Hkv")
@@ -331,6 +505,9 @@ class PFAttn:
               _sb("k1", (lt, st)), "  nisa.tensor_scalar(dst=k1, data=ki, op0=nl.greater_equal, operand0=lof)",
               _sb("k2", (lt, st)), "  nisa.tensor_scalar(dst=k2, data=ki, op0=nl.less_equal, operand0=hif)",
               f"  nisa.tensor_tensor(dst=mk{b}, data1=k1, data2=k2, op=nl.multiply)"]
+      if self.heads_per_group:
+        self._heads_batched(L, t0, lt, blocks)
+        continue
       for hq in range(Hq):
         h = hq // G
         L += [f"  # q head {hq} (kv head {h})",
@@ -349,7 +526,7 @@ class PFAttn:
                 _sb("mn", (lt, 1)), "  nisa.tensor_tensor(dst=mn, data1=mr, data2=bm, op=nl.maximum)",
                 _sb("ng", (lt, 1)), "  nisa.tensor_scalar(dst=ng, data=mn, op0=nl.multiply, operand0=-1.0)",
                 _sb("al", (lt, 1)), _sb("p", (lt, st))]
-          L += _exp2(["al", "p"], ["mr", "sm"], [f"({lt}, 1)", f"({lt}, {st})"], "  ", self.exp)
+          L += _exp2(["al", "p"], ["mr", "sm"], [f"({lt}, 1)", f"({lt}, {st})"], "  ", self.exp, self.expf)
           L += [_sb("rs", (lt, 1)), "  nisa.tensor_reduce(dst=rs, op=nl.add, data=p, axis=1)",
                 "  nisa.tensor_tensor(dst=lr, data1=lr, data2=al, op=nl.multiply)",
                 "  nisa.tensor_tensor(dst=lr, data1=lr, data2=rs, op=nl.add)",
@@ -390,8 +567,14 @@ class PFMLP:
   wn: int = 8 * TN
   fmax: int = 512
   evict: str = "act"
+  silu: int = TN       # I69: FZ_NEURON_PFK_SILU, columns per silu(gate) * up chain (capped by the gate / up block)
+  expf: bool = False   # I69: FZ_NEURON_PFK_EXPF (nki.exact_exp's fused form)
   @property
   def gu_cols(self) -> int: return block_cols(self.N, min(self.banks, 4), self.wn)
+  @property
+  def silu_cols(self) -> int:
+    """Columns per silu chain: FZ_NEURON_PFK_SILU capped by the gate / up block (exact exp only: act's kernel is main's)."""
+    return TN if self.exp == "act" else max(TN, min(self.silu, self.gu_cols)) // TN * TN
   @property
   def down_cols(self) -> int:
     """down's columns per weight DMA. I13: one row block whose down block would take every PSUM bank (D >= 4096 at 8 banks:
@@ -402,7 +585,8 @@ class PFMLP:
   def name(self) -> str:
     dc, full = self.down_cols, block_cols(self.N, self.banks, self.wn)
     return f"fz_pfmlp_{self.N}_{self.D}_{self.I}_b{self.gu_cols}_{full}" + (f"_d{dc}" if dc != full else "") + ("_act" if self.exp == "act" else "") + \
-           ("_ev" if self.evict != "act" else "")
+           ("_ev" if self.evict != "act" else "") + (f"_s{self.silu_cols}" if self.silu_cols != TN else "") + \
+           ("_xf" if self.expf and self.exp != "act" else "")
   def args(self) -> tuple[str, ...]: return tuple(["xo", "dn", "x", "o"] + (["bo"] if self.o_bias else []) + ["ln2", "wgu", "wd"])
   def render(self) -> NKIProgram:
     N, D, I = self.N, self.D, self.I
@@ -432,12 +616,13 @@ class PFMLP:
     # FZ_NEURON_PFK_EVICT=act: gate / up leave PSUM by ScalarE copies (float32 -> float32, exact on any engine), so
     # the next block's matmuls never queue behind VectorE's silu chain; vector (default): VectorE (the compiler's usual pick)
     evict = ", engine=nisa.scalar_engine" if self.evict == "act" else ""
+    SW = self.silu_cols   # I69: one chain over SW columns (elementwise: the same bits as per 512-column slice)
     def silu(c0: int, nw: int, q: int) -> None:   # block c0's silu(gate) * up and its aᵀ chunks (tiles of parity q)
       for r, (t0, Mr) in enumerate(rb):
-        for s0 in range(0, nw, TN):
-          sw = min(TN, nw - s0)
+        for s0 in range(0, nw, SW):
+          sw = min(SW, nw - s0)
           T, g, u = f"({Mr}, {sw})", f"g{r}_{q}[:, {s0}:{s0 + sw}]", f"u{r}_{q}[:, {s0}:{s0 + sw}]"
-          L.extend([_sb("a", T)] + (_silu_act(T, g, u, "a", "  ") if self.exp == "act" else _silu_mul(T, g, u, "a", "  ", False)))
+          L.extend([_sb("a", T)] + (_silu_act(T, g, u, "a", "  ") if self.exp == "act" else _silu_mul(T, g, u, "a", "  ", False, self.expf)))
           for c in range(0, sw, TK):
             kc, ci = min(TK, sw - c), (c0 + s0 + c) // TK
             L.extend([f"  ta = nl.ndarray(({kc}, {Mr}), dtype=nl.float32, buffer=nl.psum)", f"  nisa.nc_transpose(dst=ta, data=a[:, {c}:{c + kc}])",

@@ -3,6 +3,8 @@ empty = the bf16 defaults; stderr: the table the choice came from, which the job
 
   python3 scripts/nki_n8_bf16_choose.py layer <out>    # fastest bf16 layer (v2se or v2se+w<cols>[p<k>][q]) bitwise == the bf16
                                                        # members (v1) in every record (logits, pool, tokens): its N8 switches
+  python3 scripts/nki_n8_bf16_choose.py f32layer <out> # W15: fastest float32 layer (v2se or v2se+w<cols>) bitwise == the float32
+                                                       # members (v1) in every record: FZ_NEURON_F32_WN=<cols>, or empty
   python3 scripts/nki_n8_bf16_choose.py head <out>     # fastest bf16 head (b3 = MatmulBF16, b2:<W> = HeadBF16) whose logits are
                                                        # bitwise == b1-logits (MatmulBF16) and whose device argmax == np.argmax
   python3 scripts/nki_n8_bf16_choose.py same <out> <a> <b>   # serve_<a>.json vs serve_<b>.json: greedy rows and c1 tokens identical?
@@ -43,6 +45,13 @@ def layer(out: str) -> str:
   if not m: return ""
   return f"FZ_NEURON_BF16_WN={m.group(1)} FZ_NEURON_BF16_PF={m.group(2) or 0} FZ_NEURON_BF16_PFQO={1 if m.group(3) else 0}"
 
+def f32layer(out: str) -> str:
+  """W15 (scripts/nki_w15_trn1_c4.sh): the same rule on a float32 layer bench (FZ_NEURON_F32_WN; no prefetch in float32)."""
+  exact = lambda r: r.get("logits_bitwise_vs_v1") == 1.0 and r.get("pool_bitwise_vs_v1") == 1.0 and r.get("tokens_vs_v1") is True
+  best = _pick(_load(out, "layer_bench.json"), exact, "v2se", "f32layer", lambda v: v == "v2se" or re.fullmatch(r"v2se\+w\d+", v) is not None)
+  m = re.fullmatch(r"v2se\+w(\d+)", best)
+  return f"FZ_NEURON_F32_WN={m.group(1)}" if m else ""
+
 def head(out: str) -> str:
   exact = lambda r: r.get("logits_bitwise_vs_v1") == 1.0 and r.get("argmax_ok") is True
   best = _pick(_load(out, "head_bench.json"), exact, "b3", "head", lambda v: v == "b3" or v.startswith("b2"))
@@ -63,4 +72,4 @@ def same(out: str, a: str, b: str) -> str:
 
 if __name__ == "__main__":
   what, out = sys.argv[1], sys.argv[2]
-  print({"layer": lambda: layer(out), "head": lambda: head(out), "same": lambda: same(out, sys.argv[3], sys.argv[4])}[what]())
+  print({"layer": lambda: layer(out), "f32layer": lambda: f32layer(out), "head": lambda: head(out), "same": lambda: same(out, sys.argv[3], sys.argv[4])}[what]())

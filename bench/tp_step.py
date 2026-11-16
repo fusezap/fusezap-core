@@ -14,6 +14,9 @@ prompt's prefill step (TTFT without HTTP). Then, in the default mode: the kernel
 every rank, per --breakdown bucket) and the all-reduce latency per path at rows x hidden bf16 (dist.bench_allreduce,
 graphs of 50 back-to-back all-reduces). Prints one line per measurement (TP_STEP / TP_KERNELS / TP_AR JSON) and a table.
 A load that is not done on every rank within --load-timeout seconds exits 3 (TP_LOAD_TIMEOUT) instead of using the step's budget.
+W15: --ttft-ctx 128,256,512 times the prefill step of each prompt length per mode (TP_TTFT lines with the bucket that ran
+it), --prefill-breakdown 128,256 the per-kernel breakdown of the prefill forward holding each length (TP_PREFILL_KERNELS:
+class ms, GEMM TFLOP/s per projection); run one process per FZ_PREFILL_MIN to compare 128- and 256-row forwards.
 
 I60 (M5): --random PRESET (fusezap.serve.models.random_weights, full shapes, e.g. llama70b) builds every rank's slices
 of a random model instead of loading --model (no download, ~40 s on 2x H200). --env-ab entries may set mode=<mode> (the
@@ -107,6 +110,9 @@ def main() -> None:
   ap.add_argument("--max-model-len", type=int, default=8192); ap.add_argument("--num-blocks", type=int, default=8192)
   ap.add_argument("--env-ab", default="", help="NAME:K=V,K=V;NAME2:... variants: the fuse mode (or mode=<mode>) plus that environment")
   ap.add_argument("--breakdown", default="1,32"); ap.add_argument("--ar-rows", default="1,8,32,64,256,512")
+  ap.add_argument("--ttft-ctx", default="", help="W15: prompt lengths whose prefill step (TTFT without HTTP) is timed per mode (default: --ctx)")
+  ap.add_argument("--prefill-breakdown", default="", help="W15: prompt lengths whose prefill forward (the bucket that holds them) gets the "
+                  "per-kernel breakdown in the first mode, e.g. 128,256")
   ap.add_argument("--vllm", default=None, help="a Invarix report.json of vLLM on the same model / GPUs (its TPOT per concurrency)")
   ap.add_argument("--json", default=None)
   ap.add_argument("--device", default="CUDA", help="CUDA; CPU / METAL only to check the script (host backend, modes nccl)")
@@ -160,7 +166,9 @@ def main() -> None:
   pre = a.prefix
   res: dict = {"info": {"ar": g.ar_info, "model": a.model, "random": a.random, "layers": a.layers or None, "prefix": pre,
                         "env": {k: v for k, v in os.environ.items() if k.startswith(("NCCL_", "FZ_TP_"))}},
-               "steps": [], "ttft": {}, "kernels": [], "ar": []}
+               "steps": [], "ttft": {}, "ttft_ctx": {}, "kernels": [], "prefill_kernels": [], "ar": [],
+               "prefill_sizes": list(eng.prefill_sizes)}
+  ttft_ctx = [int(x) for x in (a.ttft_ctx or str(a.ctx)).split(",") if x]
   env_keys = sorted({k for _, _, e in variants for k in e})
   def save() -> None:   # after every variant: a run cut short by its time limit keeps what it measured
     if a.json:
@@ -184,6 +192,20 @@ def main() -> None:
     if env: continue
     res["ttft"][pre + name] = ttft(eng, a.ctx, 7)
     print(f"TP_TTFT {json.dumps({'variant': pre + name, 'ms': res['ttft'][pre + name], 'ctx': a.ctx})}", flush=True)
+    for cx in ttft_ctx:
+      ms = ttft(eng, cx, 11 + cx)
+      res["ttft_ctx"].setdefault(pre + name, {})[cx] = ms
+      print(f"TP_TTFT {json.dumps({'variant': pre + name, 'ms': ms, 'ctx': cx, 'bucket': next((n for n in eng.prefill_sizes if n >= cx), None)})}", flush=True)
+    save()
+    if name == variants[0][0]:   # W15: the prefill forward's kernels for these prompt lengths (captured by ttft)
+      for cx in [int(x) for x in a.prefill_breakdown.split(",") if x]:
+        n = next((b for b in eng.prefill_sizes if b >= cx), eng.prefill_sizes[-1])
+        ttft(eng, cx, 400 + cx, reps=2)
+        ks = _all(g, "fusezap.serve.tpprof:prefill_breakdown", n)
+        for k in ks: k["ctx"] = cx
+        res["prefill_kernels"].append(ks)
+        print(f"TP_PREFILL_KERNELS {json.dumps(ks)}", flush=True)
+      save()
     if name == variants[0][0]:   # the default mode: kernel breakdown per bucket (graphs captured by measure)
       for b in [int(x) for x in a.breakdown.split(",") if x]:
         measure(eng, b, a.ctx, 4, 300 + b)
@@ -209,6 +231,12 @@ def main() -> None:
   for ks in res["kernels"]:
     for k in ks:
       if "classes" in k: print(f"kernels rank {k['rank']} b{k['n']}: total {k['total_ms']} ms over {k['items']} items; {k['classes']}; GEMM TB/s {k['gemm_TBps']}")
+  for ks in res["prefill_kernels"]:
+    for k in ks:
+      if "classes" in k: print(f"prefill kernels rank {k['rank']} {k['n']} rows (prompt {k.get('ctx')}): total {k['total_ms']} ms over {k['items']} items; "
+                              f"{k['classes']}; GEMM TFLOP/s {k.get('gemm_TFLOPs')}")
+      else: print(f"prefill kernels rank {k.get('rank')}: {k.get('error')}")
+  if res["ttft_ctx"]: print("TTFT ms (prefill step, no HTTP) per prompt length: " + "; ".join(f"{v}: {d}" for v, d in res["ttft_ctx"].items()))
   for r in res["ar"]: print(f"all-reduce {r['rows']:4d} rows {r['path']:7s} {'chain' if r.get('chain') else 'interleaved':11s} {r['us']:8.2f} us  {r['GBps']:7.1f} GB/s")
   save()
   g.close()

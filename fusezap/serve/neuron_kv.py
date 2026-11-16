@@ -27,6 +27,7 @@ select(x) is a one-hot (R, N) matmul too. Costs grow with P (the KV write reads 
 every slot), which is why `fusezap serve --device NEURON` wants a small --num-blocks (scripts/nki_n5_inf2.sh: 256 x 16).
 """
 from __future__ import annotations
+import os
 from typing import Any, Sequence
 import numpy as np
 from fusezap.tensor import Tensor
@@ -108,11 +109,17 @@ class NeuronKVCache(PagedKVCache):
     # N6: the pool prefix a step's kernels touch (KV write rows, attention keys): every slot of the step's sequences is
     # below it (meta_ctx; the allocator hands out low block ids first). None: the whole pool (P).
     self.ctx: int | None = _shared.ctx if _shared is not None else None
+    self.windows: tuple[int, ...] = _shared.windows if _shared is not None else ()   # I105: per layer sliding window (0 = full)
+    self.win = max(self.windows, default=0)   # one window per model: its rows' lo (lo_w, after kid in the metadata)
 
   @staticmethod
   def for_model(model: Any, num_blocks: int, block_size: int = 16, max_seq_len: int | None = None) -> "NeuronKVCache":
     c = model.cfg
-    return NeuronKVCache(c.n_layers, c.n_kv_heads, c.head_dim, num_blocks, block_size, model.dtype, model.device, max_seq_len or model.max_len)
+    nc = NeuronKVCache(c.n_layers, c.n_kv_heads, c.head_dim, num_blocks, block_size, model.dtype, model.device, max_seq_len or model.max_len)
+    nc.windows = tuple(getattr(c, "layer_windows", None) or ())
+    assert len(set(w for w in nc.windows if w)) <= 1, "one sliding window size per model"
+    nc.win = max(nc.windows, default=0)
+    return nc
 
   def bind(self, state: list[Tensor], inputs: list[Tensor] | None = None) -> "NeuronKVCache":
     return NeuronKVCache(self.n_layers, self.n_kv, self.hd, self.num_blocks, self.bs, self.dtype, self.device, self.max_seq_len,
@@ -169,7 +176,10 @@ class NeuronKVCache(PagedKVCache):
       blk = bt[r_, j_]
       rows = (blk[:, None] * self.bs + np.arange(self.bs)[None, :]).reshape(-1)
       kid[rows] = (r_[:, None] * self.key_stride + j_[:, None] * self.bs + np.arange(self.bs)[None, :]).reshape(-1)
-    return np.concatenate([m, lo, hi, kid]).astype(np.int32)
+    if not self.win: return np.concatenate([m, lo, hi, kid]).astype(np.int32)
+    # I105 sliding window: a windowed layer's rows see keys pos - win + 1 .. pos (the same keyrange kernel, its own lo)
+    lo_w = np.where(real, row * self.key_stride + np.maximum(pos - self.win + 1, 0), 1)
+    return np.concatenate([m, lo, hi, kid, lo_w]).astype(np.int32)
   def step_meta(self, N: int, R: int, tokens: Sequence[tuple[int, int]], sel: Sequence[int]) -> np.ndarray:
     return self._extend(super().step_meta(N, R, tokens, sel), N, R)
   def step_meta_rows(self, N: int, R: int, sid: np.ndarray, pos: np.ndarray, sel: Sequence[int]) -> np.ndarray:
@@ -217,7 +227,8 @@ class NeuronKVCache(PagedKVCache):
     out = Buffer(qb.device, N * Hq * hd, dtypes.float32)
     base = L.size
     sp = AttnSpec((Hkv, 1), (N, G), P, hd, hd, (G * hd, 0, hd, 1, 0), (hd, 0, 2 * C, 1, 0), (hd, 0, 2 * C, 1, C), (G * hd, 0, hd, 1, 0),
-                  float(scale), "keyrange", (1, 0, base, base + N, base + 2 * N), rs=(Wx, Hq * hd), kv_one=True)
+                  float(scale), "keyrange", (1, 0, base + (2 * N + self.P if self.windows and self.windows[layer] else 0), base + N, base + 2 * N),
+                  rs=(Wx, Hq * hd), kv_one=True)
     J.run_item(ScheduleItem((NeuronCall(sp),), (out, qb, pb, mb), {}, "custom", 1))
     return _wrap(out, (N, Hq * hd))
   def layer(self, i: int, x: Tensor, d: Tensor | None, l: Any, cos: Tensor, sin: Tensor, n_heads: int, scale: float, eps: float,
@@ -256,6 +267,9 @@ class NeuronKVCache(PagedKVCache):
     if l.wqkv.dtype == dtypes.bfloat16:   # I68: bf16 weight matmuls; N8 (I70): + FZ_NEURON_BF16_WN / _PF / _PFQO (layer_bf16w:
       from fusezap.codegen.nki_bf16_n8 import layer_bf16w   # a whole untiled layer only; tiled layers / TP halves unchanged)
       bf = lambda s: layer_bf16w(LayerBF16(s, bf16_attn()))
+    elif v["mm"] == "mv":   # W15: float32 weights in wide tiles when FZ_NEURON_F32_WN asks (default off; whole untiled layer, same bits)
+      from fusezap.codegen.nki_f32w import layer_f32w
+      bf = layer_f32w
     else: bf = lambda s: s
     dev = self.device
     src = {"x": x, "d": d, "ln1": l.ln1, "wqkv": l.wqkv, "bqkv": l.bqkv, "cos": COS, "sin": SIN, "wt": self._step["w"], "meta": self._inputs[0],
@@ -336,6 +350,76 @@ def hbm_line(eng: Any, when: str = "") -> str:
           f"weights+constants {g(r['weights'])}, KV pool {g(r['kv'])}, forwards [{fw}], scorer {g(r['scorer'])}, cached free "
           f"{g(r['cached'])}; NEFFs {r['neffs']} ({r['neff_bytes'] / 2**20:.1f} MiB, outside the budget)"
           + (f"; runtime worker holds {g(r['worker_bytes'])}" if "worker_bytes" in r else "") + (f"; {r['ooms']} refused" if r["ooms"] else ""))
+
+def embed_bf16(model: Any) -> bool:
+  """I69, FZ_NEURON_EMBED_BF16 (default 1; 0 = main): a prefill forward uploads its token rows in the embedding table's own
+  bf16 bits (128 x 3584 at 7B: 0.9 MB instead of 1.8, under FZ_NEURON_QWRITE_MAX, so the write rides in the launch's round
+  trip instead of one of its own before it) and widens them to float32 inside the forward (exact: every bf16 is a float32).
+  Only when the table is bf16 (a float32 table's rows would be rounded) and the forward's activations are float32, and
+  not for scaled embeddings (Gemma's sqrt(hidden), Llama.embed: I105 B2 chip run 2 uploaded the raw rows, so the float32
+  server's prefill ran on unscaled embeddings and every greedy token was wrong while the scorer, through embed(), was right)."""
+  if os.environ.get("FZ_NEURON_EMBED_BF16", "1").strip() in ("", "0"): return False
+  return _raw_bf16_rows(model)
+
+def _raw_bf16_rows(model: Any) -> bool:
+  """The prefill's token rows are the bf16 table's own rows, widened (embed_bf16 / embed_dev): a bf16 table, float32
+  activations, no embedding scale."""
+  from fusezap.serve.weights import is_bf16
+  if getattr(getattr(model, "cfg", None), "embed_scale", False): return False
+  return is_neuron(model.device) and model.dtype == dtypes.float32 and is_bf16(getattr(model, "embed_host", None))
+
+def embed_dev(model: Any) -> bool:
+  """I69 follow-up, FZ_NEURON_EMBED_DEV (default 0; 1: on): a prefill forward gathers its token rows on the device from a
+  copy of the bf16 embedding table in HBM (nki_prefill.EmbedGather: one indirect row DMA per token, then the exact widen)
+  instead of uploading them (128 x 3584 bf16 = 0.9 MB per 7B step, pickled through the runtime worker's pipe and written
+  before the launch; the step uploads N int32 offsets instead). The 14 Nov inf2 run: removing the separate 1.8 MB float32
+  upload (I69's bf16 rows, under FZ_NEURON_QWRITE_MAX) took the step's host time outside the worker from 4.5 to 2.5 ms.
+  Costs one table per NeuronCore (Qwen2.5-7B: 1.09 GB; the I69 run held 8.8 of 15.25 GiB). The values are embed_bf16's
+  bit for bit (the same rows, widened the same way); the same conditions, and LLMEngine's check (embed_check) turns it off
+  if the kernel does not compile or does not return the host's rows."""
+  if os.environ.get("FZ_NEURON_EMBED_DEV", "0").strip() in ("", "0"): return False
+  if not _raw_bf16_rows(model): return False
+  V, D = (int(x) for x in model.embed_host.shape)
+  return (V - 1) * D < 2 ** 31
+
+def embed_table(model: Any) -> Tensor:
+  """The embedding table on the device (V, D) bf16 (built once per model: one write of the whole host table)."""
+  t = getattr(model, "_embed_dev", None)
+  if t is None:
+    from fusezap.serve.weights import to_dtype
+    t = model._embed_dev = upload(to_dtype(model.embed_host, dtypes.bfloat16), model.device, dtypes.bfloat16)
+  return t
+
+def embed_gather(off: Tensor, model: Any) -> Tensor:
+  """(N, D) float32 token rows from the device table at element offsets off (1, N) int32 (nki_prefill.embed_offsets):
+  one EmbedGather launch (inside a captured forward, part of its fused NEFF)."""
+  from fusezap.codegen.nki_prefill import EmbedGather
+  from fusezap.device.neuron import NeuronCall
+  from fusezap import jit as J
+  tab = embed_table(model)
+  V, D = (int(x) for x in tab.shape)
+  N = int(off.shape[-1])
+  ob = _buf(off)
+  out = Buffer(ob.device, N * D, dtypes.float32)
+  J.run_item(ScheduleItem((NeuronCall(EmbedGather(N, V, D)),), (out, ob, _buf(tab)), {}, "custom", 1))
+  return _wrap(out, (N, D))
+
+def embed_check(model: Any, n: int = 128) -> str:
+  """'' if EmbedGather returns the host table's rows exactly (n ids spread over the vocabulary, the first and last
+  included), else why not (a compile or runtime error, or the first mismatch)."""
+  from fusezap.codegen.nki_prefill import embed_offsets
+  from fusezap.serve.weights import bf16_to_f32, to_dtype
+  try:
+    V, D = (int(x) for x in model.embed_host.shape)
+    ids = np.unique(np.concatenate([[0, V - 1], np.linspace(0, V - 1, n - 2).astype(np.int64)]))[:n]
+    ids = np.concatenate([ids, np.zeros(n - len(ids), np.int64)])
+    got = embed_gather(upload(embed_offsets(ids, D), model.device, dtypes.int32), model).numpy()
+    want = bf16_to_f32(to_dtype(model.embed_host[ids], dtypes.bfloat16))
+    if got.shape != want.shape or not np.array_equal(got.view(np.int32), want.view(np.int32)):
+      bad = np.argwhere(got.view(np.int32) != want.view(np.int32))
+      return f"row {int(bad[0][0])} (id {int(ids[bad[0][0]])}) differs" if len(bad) else f"shape {got.shape} != {want.shape}"
+    return ""
+  except Exception as e: return f"{type(e).__name__}: {str(e)[:300]}"
 
 def upload(a: np.ndarray, device: str, dtype: DType) -> Tensor:
   """N7: a host array as a realized device Tensor, written straight into a new buffer (one copyin, which NeuronAllocator

@@ -318,3 +318,61 @@ def test_check_catches_broken_releases(repo, capsys):
   git(repo, "tag", "v0.1.0", "release/0.1")
   git(repo, "checkout", "-q", "v0.1.0")
   assert any("lightweight" in e for e in REL.check(r, "v0.1.0"))
+
+
+def test_draft_leaves_dates_for_cut_and_sections_must_have_content(repo, capsys):
+  """A note drafted without --date keeps {date} / {line_date}; check flags them until cut fills them with the build
+  date. A section left empty (no "None.") fails check."""
+  assert run(repo, "draft", "0.1.0") == 0
+  p = repo / "docs/releases/v0.1.0.md"
+  text = re.sub(r"<!--.*?-->", "", p.read_text(), flags=re.S)
+  assert "Released {date}. Line 0.1 (first shipped {line_date})." in text
+  text = re.sub(r"(?m)^(## (?!Support matrix|Known issues).+)$", r"\1\n\nNone.", text)
+  p.write_text(text)
+  git(repo, "add", "-A"); git(repo, "commit", "-q", "-m", "note")
+  errs = REL.check(REL.Repo(repo), "0.1.0", pre_tag=True)
+  assert any("'Known issues' is empty" in e for e in errs) and any("unfilled placeholders {date}, {line_date}" in e for e in errs)
+  assert run(repo, "cut", "0.1.0", "--date", "2026-12-03") == 1                  # still an empty section
+  assert "'Known issues' is empty" in capsys.readouterr().err and git(repo, "tag") == ""
+  p.write_text(text.replace("## Known issues\n", "## Known issues\n\n- Something, with a workaround.\n"))
+  git(repo, "commit", "-qam", "known issues")
+  assert run(repo, "cut", "0.1.0", "--date", "2026-12-03") == 0
+  note = git(repo, "show", "v0.1.0:docs/releases/v0.1.0.md")
+  assert "Released 2026-12-03. Line 0.1 (first shipped 2026-12-03). Core 0.1.0, Invarix 0.1.0." in note
+  git(repo, "checkout", "-q", "v0.1.0")
+  assert REL.check(REL.Repo(repo), "v0.1.0") == []
+
+
+def _artifacts(d: Path, version: str, wheel_extra=(), sdist_extra=(), meta_version=None):
+  import io, tarfile, zipfile
+  d.mkdir(parents=True, exist_ok=True)
+  vf = f'__version__ = "{version}"\n'
+  with zipfile.ZipFile(d / f"fusezap-{version}-py3-none-any.whl", "w") as z:
+    z.writestr("fusezap/__init__.py", ""); z.writestr("fusezap/_version.py", vf)
+    z.writestr(f"fusezap-{version}.dist-info/METADATA", f"Metadata-Version: 2.4\nName: fusezap\nVersion: {meta_version or version}\n")
+    for n in wheel_extra: z.writestr(n, "x")
+  with tarfile.open(d / f"fusezap-{version}.tar.gz", "w:gz") as t:
+    for n, data in [("fusezap/_version.py", vf), ("pyproject.toml", ""), *((n, "x") for n in sdist_extra)]:
+      b = data.encode(); ti = tarfile.TarInfo(f"fusezap-{version}/{n}"); ti.size = len(b); t.addfile(ti, io.BytesIO(b))
+
+
+def test_checksums(tmp_path, capsys):
+  import hashlib
+  good = tmp_path / "good"
+  _artifacts(good, "0.1.0")
+  assert REL.main(["checksums", "0.1.0", str(good)]) == 0
+  sums = (good / "SHA256SUMS").read_text().splitlines()
+  assert sums == [f"{hashlib.sha256((good / n).read_bytes()).hexdigest()}  {n}" for n in ("fusezap-0.1.0-py3-none-any.whl", "fusezap-0.1.0.tar.gz")]
+  for name, kw, msg in [("invarix", {"wheel_extra": ["fusezap/invarix/__init__.py"]}, "Invarix or key material"),
+                        ("keys", {"sdist_extra": ["fusezap/_keys.py"]}, "Invarix or key material"),
+                        ("meta", {"meta_version": "0.1.0.dev0"}, "METADATA Version is 0.1.0.dev0")]:
+    d = tmp_path / name
+    _artifacts(d, "0.1.0", **kw)
+    assert REL.main(["checksums", "0.1.0", str(d)]) == 1
+    assert msg in capsys.readouterr().err and not (d / "SHA256SUMS").exists()
+  stale = tmp_path / "stale"
+  _artifacts(stale, "0.1.0"); _artifacts(stale, "0.1.0rc1")
+  _, errs = REL.checksums("0.1.0", stale)
+  assert errs == ["fusezap-0.1.0rc1-py3-none-any.whl: not a 0.1.0 artifact", "fusezap-0.1.0rc1.tar.gz: not a 0.1.0 artifact"]
+  errs = REL.checksums("0.2.0", good)[1]
+  assert f"{good}: expected one fusezap-0.2.0-*.whl, found 0" in errs and "fusezap-0.1.0.tar.gz: not a 0.2.0 artifact" in errs

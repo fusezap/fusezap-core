@@ -890,10 +890,10 @@ def _tiles(L: list[str], shape: str, prefix: str):
     return name
   return new
 
-def _silu_mul(T: str, g: str, u: str, dst: str, ind: str, decl: bool) -> list[str]:
+def _silu_mul(T: str, g: str, u: str, dst: str, ind: str, decl: bool, fused: bool = False) -> list[str]:
   """dst = silu(g) * u on (128, ·) tiles of shape T, the renderer's elementwise chain (exp2(g * -log2 e) by nki.exact_exp, NaN
   copied through, 1 / (1 + e), g * that, times u): render_layer's, shared by the tiled MLP blocks (elementwise, so per block
-  the same bits). decl: declare dst (else it is a slice of an existing tile)."""
+  the same bits). decl: declare dst (else it is a slice of an existing tile). fused: nki.exact_exp's fused form (same bits)."""
   L = [f"{ind}sa = nl.ndarray({T}, dtype=nl.float32, buffer=nl.sbuf)",
        f"{ind}nisa.tensor_scalar(dst=sa, data={g}, op0=nl.multiply, operand0={NEG_LOG2E!r})",
        f"{ind}se = nl.ndarray({T}, dtype=nl.float32, buffer=nl.sbuf)"]
@@ -902,7 +902,7 @@ def _silu_mul(T: str, g: str, u: str, dst: str, ind: str, decl: bool) -> list[st
     name = f"sx{next(k)}"
     if dt is not None: L.append(f"{ind}{name} = nl.ndarray({T}, dtype=nl.{nki.nl_dtype(dt)}, buffer=nl.sbuf)")
     return name
-  nki.exact_exp(lambda ln: L.append(ind + ln), new, "se", "sa", base2=True)
+  nki.exact_exp(lambda ln: L.append(ind + ln), new, "se", "sa", base2=True, fused=fused)
   L += [f"{ind}su = nl.ndarray({T}, dtype=nl.uint8, buffer=nl.sbuf)", f"{ind}nisa.tensor_tensor(dst=su, data1=sa, data2=sa, op=nl.not_equal)",
         f"{ind}nisa.tensor_copy_predicated(dst=se, src=sa, predicate=su)",
         f"{ind}s1 = nl.ndarray({T}, dtype=nl.float32, buffer=nl.sbuf)", f"{ind}nisa.tensor_scalar(dst=s1, data=se, op0=nl.add, operand0=1.0)",
