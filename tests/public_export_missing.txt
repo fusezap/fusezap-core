@@ -9,6 +9,8 @@ scripts/engine_repro_job.sh
 scripts/gemma3_mac_check.py
 scripts/gemma3_nkishim.py
 scripts/h100_7b_check.sh
+scripts/i93_klein_speed.py
+scripts/i96_klein_chip.py
 scripts/invarix_70b_vllm.sh
 scripts/invarix_7b_h100.sh
 scripts/invarix_engine_job.sh

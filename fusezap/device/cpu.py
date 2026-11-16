@@ -4,7 +4,7 @@ CPUDevice(CompiledDevice): allocator = CPUAllocator (LRUAllocator over ctypes/np
 renderer = CRenderer(), compiler = ClangCompiler (src -> .dylib bytes), runtime = CPUProgram.
 """
 from __future__ import annotations
-import ctypes, os, shutil, subprocess, sys, tempfile, time
+import ctypes, os, platform, shutil, subprocess, sys, tempfile, time
 from typing import Any
 from fusezap.device import CompiledDevice, Compiler, LRUAllocator, Program
 from fusezap.codegen.cstyle import CRenderer
@@ -21,6 +21,9 @@ class CPUAllocator(LRUAllocator):
 
 class ClangCompiler(Compiler):
   args = ["-O2", "-shared", "-fPIC", "-ffp-contract=off", "-fwrapv", "-march=native", "-Wno-unused-function"]
+  # x86: no native float16 instructions. clang 18.1 (Ubuntu 24.04's) crashes in codegen on a float16 min kernel when
+  # -march=native turns on AVX512-FP16 (Sapphire/Granite Rapids); without it float16 maths is the same on every x86 CPU.
+  if platform.machine().lower() in ("x86_64", "amd64"): args = [*args, "-mno-avx512fp16"]
   def __init__(self, cc: str | None = None):
     self.cc = cc or os.getenv("FZ_CC") or shutil.which("clang") or "clang"
   def cache_key(self) -> str: return " ".join([self.cc, *self.args])
