@@ -636,9 +636,8 @@ slots, model) PFAttn's VectorE time is 265 us exact vs 55 act, nearly all nki.ex
   1.662 vs main 1.600 (slower). In process TP=2: 128@128 forward 49.8 -> 48.81 ms, TTFT c1 p50 51.1 -> 50.21 (all four).
   The summary picked ATTN_HB=2048, SILU=512, EXPF=1 (the bf16 upload was not measured on its own). So the model
   overstated the gains (~1 ms per forward measured vs ~6 modelled): VectorE's fixed cost per instruction is smaller on
-  inf2 than the trn1-fitted ve_fix, and the wide silu tiles cost more than they save. Both served phases failed: the
-  instance had no Invarix licence (`nki_n6b_lib.sh` now exports `.scratch/licence/chip-runs.lic`, gitignored,
-  when present). **Defaults now:** ATTN_HB 2048, SILU 512 (off), EXPF 1, EMBED_BF16 1.
+  inf2 than the trn1-fitted ve_fix, and the wide silu tiles cost more than they save. Both served phases failed on a
+  setup problem in the job script (fixed). **Defaults now:** ATTN_HB 2048, SILU 512 (off), EXPF 1, EMBED_BF16 1.
   `nki_n8_prefill_inf2.sh --i69-served` (~38 min): main vs the new defaults in process (bits), then served.
 - **Job** `nki_n8_prefill_inf2.sh --i69` (~45 min; cost guard in the script): single-core bench of each flag (device ms, bits vs
   the members), in process main vs the candidate (every prefill prefix's logits hash, 128-token TTFT, greedy 24 x 64), a

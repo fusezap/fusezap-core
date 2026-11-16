@@ -107,7 +107,7 @@ def _skip_public_export_gaps(items):
   if not names: return
   stems = {n[:-3] for n in names if n.endswith(".py")}
   rx = re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\b"
-                  + (r"|(?:\bimport\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*|\bfrom\s+)(" + "|".join(map(re.escape, sorted(stems))) + r")\b" if stems else ""))
+                  + (r"|(?:\bimport\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*|\bfrom\s+)(?:\w+\.)*(" + "|".join(map(re.escape, sorted(stems))) + r")\b" if stems else ""))
   def sources(fn, mod, seen):   # the test, the module-level helpers it calls and the module's fixtures it uses
     fn = getattr(fn, "__wrapped__", fn)
     if id(fn) in seen or not callable(fn) or getattr(fn, "__module__", None) != getattr(mod, "__name__", None): return

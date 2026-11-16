@@ -1,5 +1,6 @@
 # CPU tests for the public FuseZap Core repository. Hardware tiers (CUDA, METAL, NEURON) are not run here: they skip
-# without the hardware. The job runs only in the public repository (the private source repo carries the same file).
+# without the hardware. The jobs run only in the public repository and its private pre-publish copy
+# (fusezap-core-staging), not in the private source repo, which carries the same file.
 name: CI
 
 on:
@@ -17,7 +18,7 @@ concurrency:
 
 jobs:
   test-cpu:
-    if: github.repository == 'fusezap/fusezap-core'
+    if: contains(fromJSON('["fusezap/fusezap-core", "fusezap/fusezap-core-staging"]'), github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -36,7 +37,7 @@ jobs:
         run: uv run pytest -n auto -q -rs
 
   build:
-    if: github.repository == 'fusezap/fusezap-core'
+    if: contains(fromJSON('["fusezap/fusezap-core", "fusezap/fusezap-core-staging"]'), github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
