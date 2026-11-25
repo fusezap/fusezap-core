@@ -271,6 +271,29 @@ def test_compile_cached_and_timing(cpu, tmp_path, monkeypatch):
   assert isinstance(t, float) and t >= 0
   np.testing.assert_array_equal(ob.numpy(), [0, 1, 4, 9])
 
+F16_MIN_KERNEL = """
+void r_min(_Float16* restrict data0, _Float16* restrict data1) {
+  for (int gidx1 = 0; gidx1 < 2; gidx1++) {
+    for (int gidx0 = 0; gidx0 < 3; gidx0++) {
+      float acc0 = (-__builtin_inff());
+      for (int ridx0 = 0; ridx0 < 4; ridx0++) {
+        float cast0 = ((float)((_Float16)(-(data1[gidx1*12+gidx0*4+ridx0]))));
+        acc0 = (cast0==cast0) ? ((cast0>acc0)?cast0:acc0) : cast0;
+      }
+      data0[gidx1*3+gidx0] = (_Float16)(-((_Float16)(acc0)));
+    }
+  }
+}"""
+
+def test_f16_min_compiles_for_granite_rapids(cpu):
+  # On a Granite Rapids host -march=native enables AVX10.1-512, and clang 18.1 then crashed compiling this float16 min
+  # kernel; building for that CPU here covers it on any x86 host.
+  c = ClangCompiler()
+  if "-mno-avx10.1-512" not in c.args: pytest.skip("not x86, or the compiler predates AVX10")
+  i = c.args.index("-march=native")
+  c.args = [*c.args[:i], "-march=graniterapids", "-mavx10.1-512", *c.args[i + 1:]]
+  assert c.compile(F16_MIN_KERNEL)
+
 def test_compile_error_reports_source(cpu):
   with pytest.raises(RuntimeError, match="clang failed"): ClangCompiler().compile("void broken( {")
 
