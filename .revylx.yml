@@ -1,0 +1,50 @@
+# Revylx reviews pull requests here as an advisory reviewer: it comments, it never approves or requests changes,
+# and it is not a required check. A code owner still reviews every change (GOVERNANCE.md).
+verdict:
+  mode: advisory
+
+severity_floor: MEDIUM
+
+custom_instructions: |
+  FuseZap Core is a pre-release inference engine in Python; interfaces still move.
+  Pull requests should keep to one change and add or update tests; hardware a contributor does not have
+  (CUDA, METAL, NEURON) is skipped by the suite, so do not ask for results on it.
+  Performance claims need the hardware, the baseline and the command that reproduces them (docs/BENCH_METHOD.md).
+  FuseZap Invarix is not part of this repository: code may only reach it through the guarded optional import in
+  fusezap/__main__.py, tests that skip or check for its absence, and the fusezap.invarix.stores plugin group of
+  the public invarix_stores package. The banned_imports check below still reports edits to those lines; that is
+  expected, and the code owner dismisses those reports.
+
+ignore:
+  - "docs/status/**"
+
+checks:
+  # Revylx matches these as plain substrings of added lines, with no patterns and no per-path exemptions, so each
+  # spells out what may follow the module name: that skips invarix_stores imports. What this cannot get exactly
+  # right, the export's Invarix rule (scripts/public_export.py) and the code-owner review settle:
+  # - not caught: a bare `import fusezap.invarix` or `from fusezap import invarix` at the end of a line;
+  # - reported although allowed: an added line in fusezap/__main__.py's guarded import, in a test that skips or
+  #   checks for Invarix, naming the fusezap.invarix.stores plugin group, or in these entries themselves.
+  # Revylx reads this file from the base branch, so a pull request cannot loosen it.
+  banned_imports:
+    - "fusezap.invarix."
+    - "fusezap.invarix "
+    - "fusezap.invarix\""
+    - "fusezap.invarix'"
+    - "fusezap.invarix,"
+    - "fusezap.invarix)"
+    - "from fusezap import invarix "
+    - "from fusezap import invarix,"
+  forbidden_paths:
+    - "fusezap/invarix/**"
+    - "**/_keys.py"
+    - "**/licence_dev.py"
+    - "**/*.pem"
+    - "**/*.lic"
+    - "**/*.key"
+    - "**/.env"
+    - "**/.env.*"
+  secrets: true
+  home_paths: true
+  severity:
+    home_paths: MEDIUM
