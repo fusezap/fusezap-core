@@ -33,7 +33,7 @@ the model's own weights (several layers in rotation, so the bytes exceed L2 as i
 from __future__ import annotations
 import contextlib, json, math, os, pathlib, time
 from typing import Any, Callable
-from fusezap.helpers import CACHE_DIR
+from fusezap.helpers import CACHE_DIR, atomic_write
 
 VERSION = 1
 MAX_BX = 64
@@ -109,9 +109,7 @@ def put(k: str, entry: dict) -> dict:
     except Exception: ents = {}
     if k not in ents:
       ents[k] = entry
-      tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-      tmp.write_text(json.dumps({"version": VERSION, "entries": ents}, indent=0, sort_keys=True))
-      os.replace(tmp, p)
+      atomic_write(p, json.dumps({"version": VERSION, "entries": ents}, indent=0, sort_keys=True))
   _DISK[:] = [p, ents]
   return ents[k]
 

@@ -1,6 +1,6 @@
 """Small shared utilities. Owned by the integrator; builders must not edit."""
 from __future__ import annotations
-import functools, hashlib, math, os, pathlib
+import functools, hashlib, math, os, pathlib, tempfile
 from typing import Iterable, TypeVar
 
 T = TypeVar("T")
@@ -12,6 +12,21 @@ def getenv(key: str, default=0):
 
 DEBUG = getenv("FZ_DEBUG", 0)          # 1: kernel count + time, 2: schedule, 3: kernel AST, 4: generated source
 CACHE_DIR = pathlib.Path(os.getenv("FZ_CACHE_DIR", pathlib.Path.home() / ".cache" / "fusezap"))
+_UMASK = os.umask(0); os.umask(_UMASK)
+
+def atomic_write(path: pathlib.Path, data: bytes | str) -> None:
+  """Replace `path` with `data` so a concurrent reader sees the old file or the whole new one, never a partial write.
+  The temp file is created fresh (mkstemp: unpredictable name, never through a link planted in a shared dir) with the
+  mode a plain create would give, and removed if the write fails."""
+  fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+  try:
+    with os.fdopen(fd, "wb") as f:
+      os.fchmod(f.fileno(), 0o666 & ~_UMASK)
+      f.write(data.encode() if isinstance(data, str) else data)
+    os.replace(tmp, path)
+  except BaseException:
+    os.unlink(tmp)
+    raise
 
 def prod(xs: Iterable[T], start=1) -> T:
   return functools.reduce(lambda a, b: a * b, xs, start)

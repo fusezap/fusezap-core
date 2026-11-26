@@ -5,7 +5,7 @@ Backends live in fusezap/device/{npy,cpu,metal,cuda,neuron}.py and each defines 
 `_modules` maps a device to a module of another name (the NEURON test tiers NKISHIM/NKISIM live in neuron.py).
 """
 from __future__ import annotations
-import functools, importlib, os, threading, weakref
+import functools, importlib, weakref
 from typing import TYPE_CHECKING, Any
 from fusezap.dtype import DType, to_np
 from fusezap.helpers import getenv
@@ -134,15 +134,12 @@ class Compiler:
   def compile(self, src: str) -> bytes: raise NotImplementedError
   def cache_key(self) -> str: return ""  # compiler identity/flags; part of the disk-cache key so flag changes never reuse stale binaries
   def compile_cached(self, src: str) -> bytes:
-    from fusezap.helpers import CACHE_DIR, stable_hash
+    from fusezap.helpers import CACHE_DIR, atomic_write, stable_hash
     path = CACHE_DIR / type(self).__name__ / stable_hash(self.cache_key() + "\0" + src)
     if path.exists() and not getenv("FZ_NOCACHE"): return path.read_bytes()
     lib = self.compile(src)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # parallel test workers share the disk cache: write then rename, so no reader ever loads a half-written binary
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_bytes(lib)
-    os.replace(tmp, path)
+    atomic_write(path, lib)   # parallel test workers share the disk cache
     return lib
 
 class Program:

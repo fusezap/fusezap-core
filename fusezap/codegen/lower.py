@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 from fusezap.codegen.uops import ProgramSpec, UOp, UOps, PtrDType
 from fusezap.dtype import DType, dtypes, to_np
-from fusezap.helpers import getenv, prod
+from fusezap.helpers import atomic_write, getenv, prod
 from fusezap.ir import LazyOp, ConstBuffer
 from fusezap.ops import BufferOps, UnaryOps, BinaryOps, TernaryOps, ReduceOps
 from fusezap.shape.symbolic import Node, Var, NumNode, MulNode, DivNode, ModNode, LtNode, SumNode, AndNode, sym_infer
@@ -535,7 +535,7 @@ def beam_search(device: Any, ast: tuple, bufs: list, vals: dict, width: int, n_o
       for o in top: score[o] = min(score[o], t(o, 10))
     best = min(top, key=score.__getitem__)
   path.parent.mkdir(parents=True, exist_ok=True)
-  path.write_text(opts_to_json(best))
+  atomic_write(path, opts_to_json(best))
   return best
 
 _cache: dict[tuple, tuple[ProgramSpec, Any]] = {}
