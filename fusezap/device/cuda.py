@@ -9,7 +9,7 @@ half-written buffer.
   NVRTCCompiler   CUDA C++ -> CUBIN for the device's compute capability (`--gpu-architecture=sm_XY`); when NVRTC is older
                   than the GPU it emits PTX for its newest arch instead and the driver JIT-compiles it. Options: --fmad=false
                   (no FMA contraction), precise div/sqrt, no fast math. The disk cache key holds the arch, NVRTC version
-                  and options; cache files are written atomically (tmp + rename) since test workers share them.
+                  and options (Compiler.compile_cached writes cache files atomically).
   CUDAProgram     cuModuleLoadData + cuModuleGetFunction; __call__ = cuLaunchKernel (grid = global_size in blocks,
                   block = local_size) on dev.stream. wait=True times the launch with CUDA events and returns seconds.
   CUDAGraph       capture_graph(fn) records fn's launches (all of them go to dev.stream, which is a side stream under
@@ -21,7 +21,7 @@ compiled and launched like any kernel.
 Construction raises (so Device.available("CUDA") is False) without cuda-bindings, a driver or a GPU.
 """
 from __future__ import annotations
-import ctypes, functools, os, threading
+import ctypes, functools, os
 from typing import TYPE_CHECKING, Any
 import numpy as np
 from fusezap.helpers import getenv
@@ -97,18 +97,6 @@ class NVRTCCompiler(Compiler):
     self.cubin = cc in supported
     self.arch = f"sm_{cc}" if self.cubin else f"compute_{max(a for a in supported if a <= cc)}"
   def cache_key(self) -> str: return f"nvrtc {self.version} {self.arch} {' '.join(self.opts)}"
-  def compile_cached(self, src: str) -> bytes:
-    """Compiler.compile_cached with an atomic write: parallel test workers share the disk cache, and a reader must never
-    load a half-written CUBIN (CUDA_ERROR_INVALID_IMAGE)."""
-    from fusezap.helpers import CACHE_DIR, getenv, stable_hash
-    path = CACHE_DIR / type(self).__name__ / stable_hash(self.cache_key() + "\0" + src)
-    if path.exists() and not getenv("FZ_NOCACHE"): return path.read_bytes()
-    lib = self.compile(src)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_bytes(lib)
-    os.replace(tmp, path)
-    return lib
   def compile(self, src: str) -> bytes:
     nv = self.nvrtc
     prog = _check(nv.nvrtcCreateProgram(src.encode(), b"fz_kernel.cu", 0, [], []), "nvrtcCreateProgram")

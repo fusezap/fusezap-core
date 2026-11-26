@@ -23,7 +23,7 @@ class CPUAllocator(LRUAllocator):
 def _clang_accepts(cc: str, flag: str) -> bool:
   """Whether this compiler knows `flag` (clang rejects an unknown -m flag outright)."""
   if shutil.which(cc) is None and not os.path.exists(cc): return False
-  return subprocess.run([cc, flag, "-x", "c", "-fsyntax-only", "-"], input=b"", capture_output=True).returncode == 0
+  return subprocess.run([cc, flag, "-x", "c", "-fsyntax-only", "-"], input=b"", capture_output=True, timeout=60).returncode == 0
 
 class ClangCompiler(Compiler):
   args = ["-O2", "-shared", "-fPIC", "-ffp-contract=off", "-fwrapv", "-march=native", "-Wno-unused-function"]
@@ -33,8 +33,9 @@ class ClangCompiler(Compiler):
     # -march=native turns them on: AVX512-FP16 on Sapphire/Granite Rapids, and AVX10.1-512 on Granite Rapids, which
     # brings them back even under -mno-avx512fp16. Without them float16 maths is the same on every x86 CPU. Compilers
     # that predate AVX10 (clang < 18) reject its flag, and their -march=native cannot enable it.
+    self.args = list(ClangCompiler.args)
     if platform.machine().lower() in ("x86_64", "amd64"):
-      self.args = [*self.args, "-mno-avx512fp16", *(["-mno-avx10.1-512"] if _clang_accepts(self.cc, "-mno-avx10.1-512") else [])]
+      self.args += ["-mno-avx512fp16", *(["-mno-avx10.1-512"] if _clang_accepts(self.cc, "-mno-avx10.1-512") else [])]
   def cache_key(self) -> str: return " ".join([self.cc, *self.args])
   def compile(self, src: str) -> bytes:
     with tempfile.TemporaryDirectory(prefix="fz_cc_") as d:

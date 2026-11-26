@@ -53,6 +53,6 @@ def test_bf16_numpy_is_uint16_bits(device):
 def test_cpu_disk_cache_key_includes_flags():
   from fusezap.device.cpu import ClangCompiler
   c = ClangCompiler()
-  assert "-fwrapv" in c.args and "-fwrapv" in c.cache_key()
+  assert "-fwrapv" in c.args and "-fwrapv" in c.cache_key() and c.args is not ClangCompiler.args
   c2 = ClangCompiler(cc="/nonexistent/clang")
   assert c.cache_key() != c2.cache_key()

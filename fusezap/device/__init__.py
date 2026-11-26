@@ -5,7 +5,7 @@ Backends live in fusezap/device/{npy,cpu,metal,cuda,neuron}.py and each defines 
 `_modules` maps a device to a module of another name (the NEURON test tiers NKISHIM/NKISIM live in neuron.py).
 """
 from __future__ import annotations
-import functools, importlib, weakref
+import functools, importlib, os, threading, weakref
 from typing import TYPE_CHECKING, Any
 from fusezap.dtype import DType, to_np
 from fusezap.helpers import getenv
@@ -139,7 +139,10 @@ class Compiler:
     if path.exists() and not getenv("FZ_NOCACHE"): return path.read_bytes()
     lib = self.compile(src)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(lib)
+    # parallel test workers share the disk cache: write then rename, so no reader ever loads a half-written binary
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_bytes(lib)
+    os.replace(tmp, path)
     return lib
 
 class Program:

@@ -264,7 +264,7 @@ def test_compile_cached_and_timing(cpu, tmp_path, monkeypatch):
   b = B(); out = b.buf(0, I32, True); g = b.special(0, 4); b.store(out, g, b.alu(BinaryOps.MUL, g, g))
   src = cpu.renderer.render("sq", b.uops)
   lib1 = ClangCompiler().compile_cached(src)
-  assert any(tmp_path.rglob("*"))
+  assert any(tmp_path.rglob("*")) and not any(tmp_path.rglob("*.tmp"))
   assert ClangCompiler().compile_cached(src) == lib1
   ob = Buffer("CPU", 4, I32)
   t = CPUProgram("sq", lib1)(ob.handle, global_size=(4, 1, 1), local_size=None, wait=True)
