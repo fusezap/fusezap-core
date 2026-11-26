@@ -134,12 +134,11 @@ class Compiler:
   def compile(self, src: str) -> bytes: raise NotImplementedError
   def cache_key(self) -> str: return ""  # compiler identity/flags; part of the disk-cache key so flag changes never reuse stale binaries
   def compile_cached(self, src: str) -> bytes:
-    from fusezap.helpers import CACHE_DIR, stable_hash
+    from fusezap.helpers import CACHE_DIR, atomic_write, stable_hash
     path = CACHE_DIR / type(self).__name__ / stable_hash(self.cache_key() + "\0" + src)
     if path.exists() and not getenv("FZ_NOCACHE"): return path.read_bytes()
     lib = self.compile(src)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(lib)
+    atomic_write(path, lib)   # parallel test workers share the disk cache
     return lib
 
 class Program:

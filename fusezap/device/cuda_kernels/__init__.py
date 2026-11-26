@@ -26,10 +26,10 @@ Direct entry points (inference only, no autograd; inputs realized as contiguous 
   fp8_linear(xq, wq, sx, sw, dt)    (e4m3(xq) * sx) @ (e4m3(wq) * sw)^T in f32, output dt; sx/sw floats or (1,) f32 tensors
 """
 from __future__ import annotations
-import functools, json, os, threading
+import functools, json, threading
 from typing import Any, Callable, TYPE_CHECKING
 from fusezap.dtype import DType, dtypes
-from fusezap.helpers import CACHE_DIR, getenv, prod
+from fusezap.helpers import CACHE_DIR, atomic_write, getenv, prod
 from fusezap.device.cuda_kernels import mma, wgmma, tf32, fp8, gemm_table
 from fusezap.device.cuda_kernels._rt import Kernel, tensor_map, TMA_U8, TMA_U16
 from fusezap.device.cuda import _check
@@ -209,10 +209,7 @@ def _tune_save(key: str, val: list) -> None:
   with _tune_lock:
     db = _tune_db()
     db[key] = val
-    _TUNE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _TUNE_FILE.with_name(f"{_TUNE_FILE.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(db, indent=0, sort_keys=True))
-    os.replace(tmp, _TUNE_FILE)
+    atomic_write(_TUNE_FILE, json.dumps(db, indent=0, sort_keys=True))
 
 # ---------------------------------------------------------------- raw launcher (device addresses)
 
