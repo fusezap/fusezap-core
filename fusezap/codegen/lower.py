@@ -534,7 +534,6 @@ def beam_search(device: Any, ast: tuple, bufs: list, vals: dict, width: int, n_o
     for _ in range(3):  # interleaved rounds, best of each
       for o in top: score[o] = min(score[o], t(o, 10))
     best = min(top, key=score.__getitem__)
-  path.parent.mkdir(parents=True, exist_ok=True)
   atomic_write(path, opts_to_json(best))
   return best
 

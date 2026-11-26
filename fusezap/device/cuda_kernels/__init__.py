@@ -209,7 +209,6 @@ def _tune_save(key: str, val: list) -> None:
   with _tune_lock:
     db = _tune_db()
     db[key] = val
-    _TUNE_FILE.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(_TUNE_FILE, json.dumps(db, indent=0, sort_keys=True))
 
 # ---------------------------------------------------------------- raw launcher (device addresses)

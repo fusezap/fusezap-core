@@ -138,7 +138,6 @@ class Compiler:
     path = CACHE_DIR / type(self).__name__ / stable_hash(self.cache_key() + "\0" + src)
     if path.exists() and not getenv("FZ_NOCACHE"): return path.read_bytes()
     lib = self.compile(src)
-    path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, lib)   # parallel test workers share the disk cache
     return lib
 

@@ -30,12 +30,12 @@ class ClangCompiler(Compiler):
   def __init__(self, cc: str | None = None):
     self.cc = cc or os.getenv("FZ_CC") or shutil.which("clang") or "clang"
     # x86: no native float16 instructions. clang 18.1 (Ubuntu 24.04's) crashes in codegen on a float16 min kernel when
-    # -march=native turns them on: AVX512-FP16 on Sapphire/Granite Rapids, and AVX10.1-512 on Granite Rapids, which
-    # brings them back even under -mno-avx512fp16. Without them float16 maths is the same on every x86 CPU. Compilers
-    # that predate AVX10 (clang < 18) reject its flag, and their -march=native cannot enable it.
+    # -march=native turns them on: AVX512-FP16 on Sapphire/Granite Rapids, and on Granite Rapids also AVX10.1-256 and
+    # AVX10.1-512, each of which brings them back even under -mno-avx512fp16. Without them float16 maths is the same on
+    # every x86 CPU. Compilers that predate AVX10 (clang < 18) reject its flags, and their -march=native cannot enable it.
     self.args = list(ClangCompiler.args)
     if platform.machine().lower() in ("x86_64", "amd64"):
-      self.args += ["-mno-avx512fp16", *(["-mno-avx10.1-512"] if _clang_accepts(self.cc, "-mno-avx10.1-512") else [])]
+      self.args += ["-mno-avx512fp16", *(f for f in ("-mno-avx10.1-256", "-mno-avx10.1-512") if _clang_accepts(self.cc, f))]
   def cache_key(self) -> str: return " ".join([self.cc, *self.args])
   def compile(self, src: str) -> bytes:
     with tempfile.TemporaryDirectory(prefix="fz_cc_") as d:

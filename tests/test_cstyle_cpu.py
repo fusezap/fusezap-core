@@ -286,12 +286,12 @@ void r_min(_Float16* restrict data0, _Float16* restrict data1) {
 }"""
 
 def test_f16_min_compiles_for_granite_rapids(cpu):
-  # On a Granite Rapids host -march=native enables AVX10.1-512, and clang 18.1 then crashed compiling this float16 min
-  # kernel; building for that CPU here covers it on any x86 host.
+  # On a Granite Rapids host -march=native enables AVX10.1-256 and AVX10.1-512, and clang 18.1 then crashed compiling this
+  # float16 min kernel; building for that CPU with the same features here covers it on any x86 host.
   c = ClangCompiler()
-  if "-mno-avx10.1-512" not in c.args: pytest.skip("not x86, or the compiler predates AVX10")
+  if "-mno-avx10.1-256" not in c.args: pytest.skip("not x86, or the compiler predates AVX10")
   i = c.args.index("-march=native")
-  c.args = [*c.args[:i], "-march=graniterapids", "-mavx10.1-512", *c.args[i + 1:]]
+  c.args = [*c.args[:i], "-march=graniterapids", "-mavx10.1-256", "-mavx10.1-512", *c.args[i + 1:]]
   assert c.compile(F16_MIN_KERNEL)
 
 def test_compile_error_reports_source(cpu):

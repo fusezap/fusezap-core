@@ -1,6 +1,6 @@
 """Small shared utilities. Owned by the integrator; builders must not edit."""
 from __future__ import annotations
-import functools, hashlib, math, os, pathlib, tempfile
+import contextlib, functools, hashlib, math, os, pathlib, tempfile
 from typing import Iterable, TypeVar
 
 T = TypeVar("T")
@@ -17,7 +17,8 @@ _UMASK = os.umask(0); os.umask(_UMASK)
 def atomic_write(path: pathlib.Path, data: bytes | str) -> None:
   """Replace `path` with `data` so a concurrent reader sees the old file or the whole new one, never a partial write.
   The temp file is created fresh (mkstemp: unpredictable name, never through a link planted in a shared dir) with the
-  mode a plain create would give, and removed if the write fails."""
+  mode a plain create would give, and removed if the write fails. Missing parent directories are created."""
+  path.parent.mkdir(parents=True, exist_ok=True)
   fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
   try:
     with os.fdopen(fd, "wb") as f:
@@ -25,7 +26,7 @@ def atomic_write(path: pathlib.Path, data: bytes | str) -> None:
       f.write(data.encode() if isinstance(data, str) else data)
     os.replace(tmp, path)
   except BaseException:
-    os.unlink(tmp)
+    with contextlib.suppress(FileNotFoundError): os.unlink(tmp)
     raise
 
 def prod(xs: Iterable[T], start=1) -> T:
